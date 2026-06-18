@@ -26,8 +26,9 @@
     "db:push": "drizzle-kit push",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
-    "db:adopt": "tsx scripts/adopt-legacy.ts",
-    "db:rescue": "tsx scripts/rescue-pglite.ts",
+    "db:heal-pglite": "bun scripts/heal-pglite.ts",
+    "db:heal-pglite-resetwal": "bun scripts/heal-pglite-resetwal.ts",
+    "db:heal-orphans": "bun scripts/heal-orphan-tables.ts",
     "clean": "rm -rf dist .turbo node_modules"
   },
   "dependencies": {

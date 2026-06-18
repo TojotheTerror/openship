@@ -13,7 +13,7 @@ export default function OAuthCallbackInstall() {
   useEffect(() => {
     async function redirect() {
       try {
-        const BASE = getApiOrigin();
+        const BASE = getApiOrigin(window.location.origin);
         const res = await fetch(`${BASE}/api/github/connect`, {
           method: "POST",
           credentials: "include",

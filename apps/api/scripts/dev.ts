@@ -1,90 +1,84 @@
-import { spawn } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { spawn, execSync } from "node:child_process";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  DEFAULT_PORT,
+  DASHBOARD_RUNTIME_TARGETS,
+  type DashboardRuntimeTargetId,
+} from "@repo/core";
 
 type Mode = "local" | "saas";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(__dirname, "..");
 
-function parseMode(value: string | undefined): Mode {
-  return value === "saas" ? "saas" : "local";
-}
-
-/**
- * Best-effort `.env` peek so the dev script can know whether a var is
- * ALREADY pinned by the operator. We need this because Node's
- * `--env-file` doesn't override existing process.env entries — so if
- * we blindly add defaults at spawn time, they win over .env. By
- * reading .env first we can defer to whatever the operator pinned and
- * only inject defaults when the file is silent.
- */
-function readEnvKeys(envFile: string): Set<string> {
-  const filePath = path.join(appRoot, envFile);
-  if (!existsSync(filePath)) return new Set();
-  try {
-    const raw = readFileSync(filePath, "utf-8");
-    const keys = new Set<string>();
-    for (const line of raw.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eq = trimmed.indexOf("=");
-      if (eq < 0) continue;
-      const key = trimmed.slice(0, eq).trim();
-      if (key) keys.add(key);
-    }
-    return keys;
-  } catch {
-    return new Set();
-  }
-}
-
 function getConfig(mode: Mode) {
+  const target: DashboardRuntimeTargetId = mode === "saas" ? "cloud-saas" : "local";
+  const port =
+    target === "local"
+      ? DEFAULT_PORT.api
+      : DEFAULT_PORT.saasApi;
+
+  const baseEnv = {
+    NODE_ENV: "development",
+    OPENSHIP_TARGET: target,
+    CLOUD_MODE: mode === "saas" ? "true" : "false",
+    DEPLOY_MODE: mode === "saas" ? "cloud" : "desktop",
+  };
+
   if (mode === "saas") {
     return {
+      port,
       envFile: ".env.saas",
       env: {
-        NODE_ENV: "development",
-        CLOUD_MODE: "true",
-        DEPLOY_MODE: "cloud",
-        PGLITE_DATA_DIR: process.env.PGLITE_DATA_DIR ?? path.join(homedir(), ".openship", "data-saas"),
+        ...baseEnv,
+        PGLITE_DATA_DIR:
+          process.env.PGLITE_DATA_DIR ??
+          path.join(homedir(), ".openship", "data-saas"),
       },
     };
   }
 
-  // Local self-hosted dev. When the operator is ALSO running `bun dev:saas`
-  // on the same machine (the standard dual-dev setup), the local API
-  // should talk to the local SaaS on :4100 — not `api.openship.io`,
-  // which would reject the auth codes minted by the local SaaS with 401.
-  //
-  // We only INJECT these defaults when neither the operator's shell
-  // (process.env) nor their .env file already pins them. This way a
-  // real self-hosted user who explicitly sets CLOUD_API_URL in .env to
-  // point at production gets their value respected.
-  const envFile = ".env";
-  const pinnedKeys = readEnvKeys(envFile);
-
-  const env: Record<string, string> = {
-    NODE_ENV: "development",
-    CLOUD_MODE: "false",
-  };
-  if (!process.env.CLOUD_API_URL && !pinnedKeys.has("CLOUD_API_URL")) {
-    env.CLOUD_API_URL = "http://localhost:4100";
-  }
-  if (
-    !process.env.CLOUD_DASHBOARD_URL &&
-    !pinnedKeys.has("CLOUD_DASHBOARD_URL")
-  ) {
-    env.CLOUD_DASHBOARD_URL = "http://localhost:3002";
-  }
-
-  return { envFile, env };
+  return { port, envFile: ".env", env: baseEnv };
 }
 
-const mode = parseMode(process.argv[2]);
+/**
+ * Free the port before spawning. Hot-reload's old child may still be
+ * holding the listener for a few ms after SIGTERM — we kill anything
+ * bound to OUR target port so the new child can bind cleanly. macOS
+ * (lsof) and linux both support this; on windows just skip.
+ */
+function freePort(port: number): void {
+  if (process.platform === "win32") return;
+  try {
+    const pids = execSync(`lsof -ti tcp:${port} 2>/dev/null || true`, {
+      encoding: "utf-8",
+    })
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (pids.length === 0) return;
+    console.log(`[dev] freeing port ${port} (killing ${pids.join(", ")})`);
+    execSync(`kill -9 ${pids.join(" ")} 2>/dev/null || true`);
+  } catch {
+    // best-effort
+  }
+}
+
+const mode: Mode = process.argv[2] === "saas" ? "saas" : "local";
 const config = getConfig(mode);
+
+// Verify the table also resolved to the same port. Cheap sanity check
+// that catches schema drift (table edited but DEFAULT_PORT not).
+const resolved = DASHBOARD_RUNTIME_TARGETS[mode === "saas" ? "cloud-saas" : "local"];
+if (resolved.ports.api !== config.port) {
+  throw new Error(
+    `dev script port mismatch: DEFAULT_PORT=${config.port}, table=${resolved.ports.api}`,
+  );
+}
+
+freePort(config.port);
 
 const child = spawn(
   "node",
@@ -92,10 +86,7 @@ const child = spawn(
   {
     cwd: appRoot,
     stdio: "inherit",
-    env: {
-      ...process.env,
-      ...config.env,
-    },
+    env: { ...process.env, ...config.env },
   },
 );
 
@@ -104,6 +95,21 @@ child.on("exit", (code, signal) => {
     process.kill(process.pid, signal);
     return;
   }
-
   process.exit(code ?? 0);
 });
+
+// On Ctrl-C / kill, free the port AGAIN so a follow-up `bun dev` boots
+// cleanly. Without this, the child may still be in TIME_WAIT.
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.on(sig, () => {
+    try {
+      child.kill(sig);
+    } catch {
+      // ignore
+    }
+    setTimeout(() => {
+      freePort(config.port);
+      process.exit(0);
+    }, 200);
+  });
+}

@@ -2,11 +2,12 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { env, trustedOrigins } from "./config/env";
-import { errorHandler, handleApiError } from "./middleware/error-handler";
+import { handleApiError } from "./middleware/error-handler";
 import { rateLimiter } from "./middleware/rate-limiter";
 import { clientIpMiddleware } from "./middleware/client-ip";
 import { betterAuthShield } from "./middleware/better-auth-shield";
-import { bootstrapPlatform } from "./lib/controller-helpers";
+import { initPlatform } from "@repo/adapters";
+import { resolvePlatformConfig } from "./lib/controller-helpers";
 
 import { authRoutes } from "./modules/auth/auth.routes";
 import { projectRoutes } from "./modules/projects/project.routes";
@@ -36,7 +37,7 @@ import { getJobRunner } from "./lib/job-runner";
 import { repos } from "@repo/db";
 
 /* ---------- Initialize platform (runtime + infra + system) ---------- */
-await bootstrapPlatform();
+await initPlatform(resolvePlatformConfig());
 
 export const app = new Hono();
 
@@ -48,7 +49,6 @@ app.use(
     credentials: true,
   }),
 );
-app.use("*", errorHandler);
 app.use("*", logger());
 app.use("*", clientIpMiddleware);
 

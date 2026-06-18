@@ -195,7 +195,7 @@ export async function verifyDomain(domainId: string, organizationId: string) {
     }).catch((err) => {
       console.error(
         `[DOMAIN] Background SSL provisioning failed for ${domain.hostname}:`,
-        err instanceof Error ? err.message : err,
+        safeErrorMessage(err),
       );
     });
 

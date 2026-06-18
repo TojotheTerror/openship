@@ -1,37 +1,40 @@
 import { z } from "zod";
 import {
-  getDashboardRuntimeTarget,
-  getDashboardRuntimeOrigins,
+  runtimeTarget,
+  runtimeTargetId,
+  cloudRuntimeTarget,
+  cloudRuntimeTargetId,
+  dashboardRuntimeOrigins,
   LOCAL_WEB_URL,
-  resolveDashboardRuntimeTarget,
 } from "@repo/core";
 
+export { runtimeTarget, runtimeTargetId, cloudRuntimeTarget, cloudRuntimeTargetId };
+
 const DEFAULT_BETTER_AUTH_SECRET = "change-me-in-production";
+
+/**
+ * Parse a string env var as boolean. Accepts "true"/"1" → true,
+ * "false"/"0"/"" → false. Defaults match the surrounding semantics.
+ */
+const envBool = (defaultValue: "true" | "false" | "" = "") =>
+  z
+    .enum(["true", "false", "1", "0", ""])
+    .default(defaultValue)
+    .transform((v) => v === "true" || v === "1");
 
 /**
  * API configuration - loaded from environment variables.
  *
  * CLOUD_MODE=true enables billing, metering, and multi-tenant features.
  * Runtime URL/port values are hardcoded in @repo/core runtime targets.
+ * DATABASE_URL is read directly from `process.env` by @repo/db (not
+ * routed through this schema).
  */
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
 
   /* ---------- Mode ---------- */
-  CLOUD_MODE: z
-    .enum(["true", "false", "1", "0", ""])
-    .default("false")
-    .transform((v) => v === "true" || v === "1"),
-  /**
-   * Override the cloud target's API URL. The local API normally talks
-   * to `https://api.openship.io` for cloud features (App install, OAuth
-   * exchange, etc.) — set this to point at a local SaaS dev instance
-   * (`http://localhost:4100`) so a single machine can run both sides
-   * of the connect flow.
-   */
-  CLOUD_API_URL: z.string().optional(),
-  /** Override the cloud dashboard URL — defaults to `https://app.openship.io`. */
-  CLOUD_DASHBOARD_URL: z.string().optional(),
+  CLOUD_MODE: envBool("false"),
   /**
    * Deployment mode - determines the runtime + infrastructure combination:
     *   - "docker"  (default) → Docker runtime + OpenResty routing/SSL (self-hosted)
@@ -41,12 +44,21 @@ const envSchema = z.object({
    */
   DEPLOY_MODE: z.enum(["docker", "bare", "cloud", "desktop"]).default("docker"),
 
-  /* ---------- Database ---------- */
-  DATABASE_URL: z.string().default(""),
-
   /* ---------- Auth (Better Auth) ---------- */
-  BETTER_AUTH_SECRET: z.string().min(1).default(DEFAULT_BETTER_AUTH_SECRET),
+  BETTER_AUTH_SECRET: z.string().default(DEFAULT_BETTER_AUTH_SECRET),
   BETTER_AUTH_COOKIE_DOMAIN: z.string().optional(),
+  /**
+   * Gate that ENABLES the option to toggle `authMode → "none"` (zero-auth)
+   * via the settings endpoint on non-desktop deployments. The operator
+   * must explicitly set this to `true` to opt in — without it, the
+   * PATCH /api/system/settings endpoint refuses to accept `"none"` on
+   * non-desktop deployments. This is intentional: zero-auth on a
+   * network-reachable instance means anyone who can hit the API can act
+   * as admin, so flipping it must be a deliberate two-step (env var +
+   * settings write) rather than a single dashboard click. Desktop
+   * deployments ignore this flag — zero-auth is the default there.
+   */
+  OPENSHIP_ALLOW_ZERO_AUTH: envBool("false"),
   /**
    * Cloud-session IP/UA pinning policy. Applied by cloudSessionAuth
    * middleware when a local instance presents a cloud_session_token.
@@ -127,10 +139,7 @@ const envSchema = z.object({
    * authenticated user), defaults ON for self-hosted single-operator
    * installs where the API process owns the host.
    */
-  BACKUP_ALLOW_LOCAL_DESTINATION: z
-    .enum(["true", "false", "1", "0", ""])
-    .default("")
-    .transform((v) => v === "true" || v === "1"),
+  BACKUP_ALLOW_LOCAL_DESTINATION: envBool(),
   /**
    * Absolute path that bounds every `kind: 'local'` destination.
    * Endpoints must resolve to a subpath of this root. Default
@@ -172,10 +181,7 @@ const envSchema = z.object({
   MAIL_WEBMAIL_ADMIN_TOKEN: z.string().optional(),
 
   /** Enables verbose timing logs for SSH/system checks and environment detection */
-  SYSTEM_DEBUG_LOGS: z
-    .enum(["true", "false", "1", "0", ""])
-    .default("")
-    .transform((v) => v === "true" || v === "1"),
+  SYSTEM_DEBUG_LOGS: envBool(),
 
   /* ---------- Interactive terminal (xterm over WebSocket → ssh2 PTY) ---------- */
   /**
@@ -229,73 +235,36 @@ const envSchema = z.object({
     .default(512 * 1024),
 });
 
-type ParsedEnv = z.infer<typeof envSchema>;
-export type Env = ParsedEnv & { PORT: number };
-
-function normalizeHttpOrigin(value: string, source: string) {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      throw new Error("unsupported protocol");
-    }
-
-    url.pathname = "/";
-    url.search = "";
-    url.hash = "";
-    return url.toString().replace(/\/$/, "");
-  } catch {
-    throw new Error(`${source} must be a valid http(s) origin.`);
-  }
-}
-
-function unique(values: string[]) {
-  return [...new Set(values)];
-}
-
-function validateProductionConfig(parsedEnv: Env, target: { id: string }) {
-  if (parsedEnv.NODE_ENV !== "production") {
-    return;
-  }
-
-  const errors: string[] = [];
-
-  if (parsedEnv.BETTER_AUTH_SECRET === DEFAULT_BETTER_AUTH_SECRET) {
-    errors.push("BETTER_AUTH_SECRET must be set to a secure value in production.");
-  }
-
-  if (parsedEnv.CLOUD_MODE && target.id !== "cloud-saas") {
-    errors.push("CURRENT_SAAS_RUNTIME_TARGET_ID must be cloud-saas in production.");
-  }
-
-  if (errors.length > 0) {
-    throw new Error(errors.join(" "));
-  }
-}
+type Env = z.infer<typeof envSchema> & { PORT: number };
 
 const parsedEnv = envSchema.parse(process.env);
 
-export const runtimeTarget = resolveDashboardRuntimeTarget({
-  cloudMode: parsedEnv.CLOUD_MODE,
-});
-
-// The "cloud" target the local API talks to for OAuth exchange, App
-// install URL minting, etc. Defaults to whatever the runtime config
-// pins (`api.openship.io` in production) but allows an env override
-// so dual-local dev (`bun dev:local` + `bun dev:saas`) can wire the
-// two halves together without editing core.
-const _resolvedCloudTarget = getDashboardRuntimeTarget(runtimeTarget.cloudTargetId);
-export const cloudRuntimeTarget = {
-  ..._resolvedCloudTarget,
-  api: parsedEnv.CLOUD_API_URL || _resolvedCloudTarget.api,
-  dashboard: parsedEnv.CLOUD_DASHBOARD_URL || _resolvedCloudTarget.dashboard,
-};
+// Print resolution at MODULE LOAD, before any handler runs. If
+// boot crashes (e.g. EADDRINUSE on listen), this still shows. The
+// runtime-target row is resolved in @repo/core/runtime-config from
+// OPENSHIP_TARGET; no NODE_ENV magic, no CLOUD_MODE inference here.
+console.log(
+  `[env] OPENSHIP_TARGET=${process.env.OPENSHIP_TARGET ?? "(unset, default local)"}  ` +
+    `→ self=${runtimeTargetId} (${runtimeTarget.api})  ` +
+    `cloud=${cloudRuntimeTargetId} (${cloudRuntimeTarget.api})`,
+);
 
 export const env: Env = {
   ...parsedEnv,
   PORT: runtimeTarget.ports.api,
 };
 
-validateProductionConfig(env, runtimeTarget);
+// Safety guard — never boot on a deployable target with the placeholder
+// auth secret. `local` is allowed because that's pure-dev / desktop.
+// The secret is a real secret in every saas-shaped deployment.
+if (
+  runtimeTargetId !== "local" &&
+  env.BETTER_AUTH_SECRET === DEFAULT_BETTER_AUTH_SECRET
+) {
+  throw new Error(
+    `BETTER_AUTH_SECRET must be set to a secure value when OPENSHIP_TARGET="${runtimeTargetId}".`,
+  );
+}
 
 // ─── Self-hosted GitHub App creds are deprecated ────────────────────────────
 //
@@ -323,17 +292,20 @@ if (!env.CLOUD_MODE) {
   }
 }
 
-/** Parsed trusted origins - single source of truth for CORS + Better Auth */
-export const trustedOrigins = unique([
-  normalizeHttpOrigin(runtimeTarget.dashboard, `runtime target ${runtimeTarget.id} dashboard`),
-  normalizeHttpOrigin(runtimeTarget.api, `runtime target ${runtimeTarget.id} api`),
-  ...(env.NODE_ENV === "production"
-    ? []
-    : [
-        LOCAL_WEB_URL,
-        ...getDashboardRuntimeOrigins(),
-      ]),
-]);
+/**
+ * Trusted origins for CORS + Better Auth. Runtime-target URLs are
+ * hardcoded clean origins from `@repo/core` (no trailing slashes,
+ * always http(s)) so we just dedupe them — no normalization needed.
+ */
+export const trustedOrigins = [
+  ...new Set([
+    runtimeTarget.dashboard,
+    runtimeTarget.api,
+    ...(env.NODE_ENV === "production"
+      ? []
+      : [LOCAL_WEB_URL, ...dashboardRuntimeOrigins]),
+  ]),
+];
 
 /** Internal loopback URL for the API (used by nginx webhook proxy, etc.) */
 export const internalApiUrl = `http://127.0.0.1:${env.PORT}`;

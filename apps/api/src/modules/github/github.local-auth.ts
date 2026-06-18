@@ -23,14 +23,15 @@ import { homedir } from "os";
 import { join } from "path";
 import { createOAuthDeviceAuth } from "@octokit/auth-oauth-device";
 import { env } from "../../config/env";
-import { TtlCache } from "../../lib/cache";
+import { cacheStore } from "../../lib/cache-store";
 import { systemDebug } from "../../lib/system-debug";
 import { getGitHubAuthMode } from "./github.auth";
 import { safeErrorMessage } from "@repo/core";
 
 // ─── Cache ───────────────────────────────────────────────────────────────────
 
-const cache = new TtlCache<string>({ maxSize: 100, sweepIntervalMs: 60_000 });
+const GH_CLI_TOKEN_TTL_S = 5 * 60;
+const GH_CLI_TOKEN_KEY = "local:gh-cli-token";
 
 // ─── Token resolution ────────────────────────────────────────────────────────
 
@@ -43,25 +44,20 @@ export async function getLocalGhToken(): Promise<string | null> {
   const mode = getGitHubAuthMode();
   if (mode === "app" || mode === "oauth") return null;
 
-  const cacheKey = "local:gh-cli-token";
-  const cached = cache.get(cacheKey);
+  const store = await cacheStore<string>("gh-cli-token");
+  const cached = await store.get(GH_CLI_TOKEN_KEY);
   if (cached) return cached;
 
   let token = await ghAuthTokenViaCli();
-  if (!token) {
-    token = await ghAuthTokenViaConfig();
-  }
-  if (token) {
-    cache.set(cacheKey, token, 5 * 60);
-  }
+  if (!token) token = await ghAuthTokenViaConfig();
+  if (token) await store.set(GH_CLI_TOKEN_KEY, token, GH_CLI_TOKEN_TTL_S);
   return token;
 }
 
-/**
- * Invalidate the cached gh CLI token (e.g. after the user re-authenticates).
- */
-export function invalidateLocalGhToken(): void {
-  cache.invalidateBySubstring("local:gh-cli-token");
+/** Invalidate the cached gh CLI token (e.g. after the user re-authenticates). */
+export async function invalidateLocalGhToken(): Promise<void> {
+  const store = await cacheStore<string>("gh-cli-token");
+  await store.delete(GH_CLI_TOKEN_KEY);
 }
 
 // ─── Status ──────────────────────────────────────────────────────────────────
@@ -337,11 +333,12 @@ export async function startDeviceFlow(userId: string): Promise<Verification> {
 
     // Start polling in background - resolves when user completes auth
     auth({ type: "oauth" })
-      .then((result) => {
+      .then(async (result) => {
         state.status = "complete";
         state.token = result.token;
-        // Cache the token so resolveToken() picks it up
-        cache.set("local:gh-cli-token", result.token, 8 * 60 * 60);
+        // Cache the token so getLocalGhToken() picks it up
+        const store = await cacheStore<string>("gh-cli-token");
+        await store.set(GH_CLI_TOKEN_KEY, result.token, 8 * 60 * 60);
       })
       .catch((err: Error) => {
         state.status = "error";

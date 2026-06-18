@@ -1,6 +1,7 @@
 import { serve } from "@hono/node-server";
 import { app } from "./app";
-import { env } from "./config/env";
+import { cloudRuntimeTarget, cloudRuntimeTargetId, env, runtimeTargetId } from "./config/env";
+import { getAuthMode } from "./lib/auth-mode";
 import { getJobRunner } from "./lib/job-runner";
 import { enforceRouteScanAtBoot } from "./lib/route-scanner";
 
@@ -12,8 +13,31 @@ const port = env.PORT;
 enforceRouteScanAtBoot(app);
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
-  console.log(`🚀 Openship API running on http://localhost:${info.port}`);
+  console.log(`Openship API running on http://localhost:${info.port}`);
+  // Visible echo of the resolved runtime + cloud target. The full
+  // `[env]` line at module load already prints OPENSHIP_TARGET + the
+  // resolved URLs; this second line confirms the SAME resolution at
+  // serve-time so anyone seeing a wrong URL can immediately tell
+  // whether the process picked the right row.
+  console.log(
+    `  runtime=${runtimeTargetId}  cloud=${cloudRuntimeTargetId} (${cloudRuntimeTarget.dashboard})`,
+  );
 });
+
+// Boot-time WARNING when zero-auth is enabled on a non-desktop
+// deployment. The loopback-only guard in authMiddleware is the actual
+// safety net (zero-auth requests are refused unless they originate
+// from 127.0.0.1/::1) — this banner exists so an operator who flipped
+// the switch and then bound the API to a public interface sees a
+// screaming log line every restart.
+void (async () => {
+  if (env.DEPLOY_MODE === "desktop") return;
+  if ((await getAuthMode()) !== "none") return;
+  console.error("");
+  console.error("!!! ZERO-AUTH ENABLED — anyone reaching this instance can act as admin.");
+  console.error("!!! Loopback-only guard is in authMiddleware.");
+  console.error("");
+})();
 
 // WebSocket support is needed for:
 //   - interactive server terminal (self-hosted only)

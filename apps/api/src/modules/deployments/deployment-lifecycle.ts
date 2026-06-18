@@ -16,7 +16,8 @@
 import { repos, type Project, type Deployment } from "@repo/db";
 import { DockerRuntime, type LogEntry } from "@repo/adapters";
 import type { RuntimeAdapter } from "@repo/adapters";
-import { SYSTEM } from "@repo/core";
+import { SYSTEM, safeErrorMessage } from "@repo/core";
+import type { DeploymentMeta } from "../../lib/deployment-runtime";
 import { notification } from "../../lib/notification-dispatcher";
 import { audit } from "../../lib/audit";
 import * as sessionManager from "./session-manager";
@@ -161,17 +162,6 @@ export async function onFailure(
   );
 }
 
-/** Find any owner of the org for notifications. */
-async function findOrgOwnerForNotification(
-  organizationId: string,
-): Promise<{ email: string } | null> {
-  const members = await repos.member.listByOrganization(organizationId).catch(() => []);
-  const owner = members.find((m) => m.role === "owner") ?? members[0];
-  if (!owner) return null;
-  const user = await repos.user.findById(owner.userId).catch(() => null);
-  return user?.email ? { email: user.email } : null;
-}
-
 export async function onCancelled(
   ctx: LifecycleContext,
   durationMs?: number,
@@ -231,14 +221,27 @@ export async function onSuccess(
   const { project, dep, buildSessionId, persistLogs } = ctx;
 
   await repos.deployment.setContainerId(dep.id, result.containerId, result.url);
+  const mergedMeta = result.metaPatch ? { ...((dep.meta as DeploymentMeta | null) ?? {}), ...result.metaPatch } : ((dep.meta as DeploymentMeta | null) ?? null);
   await repos.deployment.updateStatus(dep.id, "ready", {
     errorMessage: null,
-    meta: result.metaPatch
-      ? { ...((dep.meta as Record<string, unknown> | null) ?? {}), ...result.metaPatch }
-      : dep.meta,
+    meta: mergedMeta,
   });
 
   await repos.project.setActiveDeployment(project.id, dep.id);
+
+  // deployment.meta is the per-deploy historical snapshot; the
+  // project column is the CURRENT cloud binding. Drift detection
+  // reads the project column.
+  if (mergedMeta?.workspaceId) {
+    await repos.project
+      .setCloudWorkspaceId(project.id, mergedMeta.workspaceId)
+      .catch((err) =>
+        console.warn(
+          `[deployment-lifecycle] setCloudWorkspaceId failed project=${project.id} workspace=${mergedMeta.workspaceId}: ${safeErrorMessage(err)}`,
+        ),
+      );
+  }
+
   await repos.deployment.finishBuildSession(buildSessionId, "ready", result.durationMs, persistLogs());
   sessionManager.updateStatus(dep.id, "ready", {
     warningMessage: result.warningMessage,

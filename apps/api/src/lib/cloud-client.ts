@@ -11,9 +11,11 @@
  */
 
 import { repos } from "@repo/db";
+import { safeErrorMessage } from "@repo/core";
 import type { CloudPreflightData } from "./cloud-preflight";
-import { cloudRuntimeTarget } from "../config/env";
+import { cloudRuntimeTarget, cloudRuntimeTargetId } from "../config/env";
 import { decrypt } from "./encryption";
+import { cacheStore, type CacheStore } from "./cache-store";
 
 export interface CloudAccount {
   name: string;
@@ -21,18 +23,20 @@ export interface CloudAccount {
   image?: string | null;
 }
 
-// ─── Namespace token cache ───────────────────────────────────────────────────
+// Shared CacheStore namespaces. cacheStore is idempotent per
+// namespace — same name always returns the same store. Redis when
+// reachable, memory fallback otherwise. Refresh tokens 5 min before
+// Oblien's 30-min TTL so a cached value is always still valid.
 
 interface TokenCache {
   token: string;
   namespace: string;
-  expiresAt: number; // epoch ms
 }
 
-const tokenCache = new Map<string, TokenCache>();
-const REFRESH_BUFFER_MS = 5 * 60 * 1000;
+const TOKEN_TTL_S = 25 * 60;
+const STATUS_TTL_S = 5 * 60;
 
-// ─── Authenticated cloud fetch ───────────────────────────────────────────────
+// ─── Authenticated cloud fetch (INTERNAL primitives) ─────────────────────────
 
 /**
  * Make an authenticated request to the SaaS API using the stored cloud session.
@@ -40,7 +44,7 @@ const REFRESH_BUFFER_MS = 5 * 60 * 1000;
  * Handles: read session → decrypt → Bearer auth → 401 session cleanup.
  * Returns the Response, or null if not connected.
  */
-async function cloudFetch(
+export async function cloudFetch(
   userId: string,
   path: string,
   init?: RequestInit,
@@ -50,9 +54,11 @@ async function cloudFetch(
 
   const sessionToken = decrypt(settings.cloudSessionToken);
 
+  const targetUrl = `${cloudRuntimeTarget.api}${path}`;
+  console.log(`[cloud-client] → ${targetUrl}  (cloudRuntimeTargetId=${cloudRuntimeTargetId})`);
   let res: Response;
   try {
-    res = await fetch(`${cloudRuntimeTarget.api}${path}`, {
+    res = await fetch(targetUrl, {
       ...init,
       headers: {
         "Content-Type": "application/json",
@@ -60,14 +66,15 @@ async function cloudFetch(
         Authorization: `Bearer ${sessionToken}`,
       },
     });
-  } catch {
-    // Network error (ECONNREFUSED, DNS failure, timeout, etc.)
+  } catch (err) {
+    console.warn(`[cloud-client] fetch failed ${targetUrl}: ${(err as Error).message}`);
     return null;
   }
 
   if (res.status === 401) {
     await repos.settings.update(userId, { cloudSessionToken: null });
-    tokenCache.delete(userId);
+    const tokens = await cacheStore<TokenCache>("oblien-ns-tokens");
+    await tokens.delete(userId);
   }
 
   return res;
@@ -116,240 +123,7 @@ async function readCloudJson<T>(res: Response): Promise<T | null> {
   }
 }
 
-// ─── Cloud session management ────────────────────────────────────────────────
-
-/**
- * Disconnect from Openship Cloud.
- *
- * Two-step: (1) tell SaaS to revoke the session row server-side, then
- * (2) clear the local copy. Step 1 is best-effort — if SaaS is
- * unreachable we still clear locally so the user isn't stuck. Without
- * step 1 the SaaS session would linger for its full 30-day TTL,
- * usable by anyone who exfiltrated the token from local DB before the
- * disconnect.
- */
-export async function disconnectCloud(userId: string): Promise<void> {
-  try {
-    const res = await cloudFetch(userId, "/api/cloud/disconnect", {
-      method: "POST",
-    });
-    if (res && !res.ok) {
-      console.warn(
-        `[cloud disconnect] SaaS returned ${res.status} on session revoke; clearing local anyway`,
-      );
-    }
-  } catch (err) {
-    console.warn(
-      `[cloud disconnect] SaaS revoke failed (clearing local anyway):`,
-      err instanceof Error ? err.message : err,
-    );
-  }
-  await repos.settings.update(userId, { cloudSessionToken: null });
-  tokenCache.delete(userId);
-}
-
-/**
- * Check whether the user has a stored cloud session.
- */
-export async function isCloudConnected(userId: string): Promise<boolean> {
-  const settings = await repos.settings.findByUser(userId);
-  return !!settings?.cloudSessionToken;
-}
-
-export async function getCloudConnectionStatus(
-  userId: string,
-): Promise<{ connected: boolean; user?: CloudAccount }> {
-  const settings = await repos.settings.findByUser(userId);
-  if (!settings?.cloudSessionToken) {
-    return { connected: false };
-  }
-
-  const res = await cloudFetch(userId, "/api/cloud/account", { method: "GET" });
-
-  if (!res) {
-    return { connected: true };
-  }
-
-  if (res.status === 401) {
-    return { connected: false };
-  }
-
-  if (!res.ok) {
-    return { connected: true };
-  }
-
-  const json = await readCloudJson<{ user?: CloudAccount }>(res);
-  if (!json) return { connected: true };
-  return json.user
-    ? { connected: true, user: json.user }
-    : { connected: true };
-}
-
-// ─── Namespace token fetching ────────────────────────────────────────────────
-
-/**
- * Get a valid namespace-scoped Oblien token for a user.
- *
- * Reads the stored cloud session from DB, calls POST /api/cloud/token
- * on the SaaS API, caches the result in memory.
- *
- * Returns null if the user isn't connected to Openship Cloud.
- */
-export async function getCloudToken(
-  userId: string,
-): Promise<{ token: string; namespace: string } | null> {
-  // Check memory cache first
-  const cached = tokenCache.get(userId);
-  if (cached && cached.expiresAt - Date.now() > REFRESH_BUFFER_MS) {
-    return { token: cached.token, namespace: cached.namespace };
-  }
-
-  const res = await cloudFetch(userId, "/api/cloud/token", { method: "POST" });
-  if (!res || !res.ok) return null;
-
-  const json = await readCloudJson<{
-    data: { token: string; namespace: string; expiresAt: string };
-  }>(res);
-  if (!json?.data) return null;
-
-  const { token, namespace, expiresAt } = json.data;
-
-  tokenCache.set(userId, {
-    token,
-    namespace,
-    expiresAt: new Date(expiresAt).getTime(),
-  });
-
-  return { token, namespace };
-}
-
-/**
- * Org-scoped cloud-token lookup. Returns the owner's cloud token —
- * only the owner can link Openship Cloud, and their connection is the
- * org's cloud identity for every member to use under the hood.
- */
-export async function getOrgCloudToken(
-  organizationId: string,
-): Promise<{ token: string; namespace: string; userId: string } | null> {
-  const settings = await repos.settings
-    .findOrgOwnerCloudLink(organizationId)
-    .catch(() => undefined);
-  if (!settings) return null;
-  const token = await getCloudToken(settings.userId);
-  if (!token) return null;
-  return { ...token, userId: settings.userId };
-}
-
-/**
- * Preflight is org-scoped (slug availability, custom-domain DNS,
- * namespace quota all check against the org owner's namespace).
- */
-export async function getCloudPreflight(
-  organizationId: string,
-  input: { slug?: string; customDomain?: string },
-): Promise<CloudPreflightData | null> {
-  const res = await cloudFetchAsOrgOwner(organizationId, "/api/cloud/preflight", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-  if (!res || !res.ok) return null;
-  const json = await readCloudJson<{ data: CloudPreflightData }>(res);
-  return json?.data ?? null;
-}
-
-// ─── Edge proxy sync ─────────────────────────────────────────────────────────
-
-/**
- * Ask the SaaS to create/update an Oblien edge proxy for a managed domain.
- *
- * Sends just the slug + target IP - the SaaS constructs the full domain.
- */
-export async function syncEdgeProxy(
-  organizationId: string,
-  slug: string,
-  target: string,
-): Promise<void> {
-  const res = await cloudFetchAsOrgOwner(organizationId, "/api/cloud/edge-proxy", {
-    method: "POST",
-    body: JSON.stringify({ slug, target }),
-  });
-  if (!res) {
-    throw new Error(
-      "Cannot sync edge proxy: no member of this organization has linked Openship Cloud",
-    );
-  }
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Edge proxy sync failed (${res.status}): ${text}`);
-  }
-}
-
-// ─── Analytics proxy ─────────────────────────────────────────────────────────
-
-/**
- * Proxy an analytics call through the SaaS using master Oblien credentials.
- *
- * Edge proxies + analytics are account-level - namespace tokens can't access them.
- * Local/desktop instances call this; the SaaS uses its master client.
- */
-export async function cloudAnalyticsProxy<T>(
-  organizationId: string,
-  operation: "timeseries" | "requests" | "streamToken",
-  domain: string,
-  params?: Record<string, unknown>,
-): Promise<T | null> {
-  const res = await cloudFetchAsOrgOwner(organizationId, "/api/cloud/analytics", {
-    method: "POST",
-    body: JSON.stringify({ operation, domain, params }),
-  });
-  if (!res?.ok) return null;
-  return readCloudJson<T>(res);
-}
-
-// ─── Pages proxy ─────────────────────────────────────────────────────────────
-
-/**
- * Proxy an Oblien pages.create call through the SaaS using master
- * credentials. Required for `domain: "opsh.io"` (or any shared zone) —
- * namespace tokens can't create on account-level DNS.
- *
- * Returns the raw `{ page: { slug, url? } }` shape Oblien's SDK
- * returns, so the call site can drop it into the existing flow with
- * no changes. Throws on failure (caller wraps with a friendly error).
- */
-export async function cloudPagesProxy(
-  organizationId: string,
-  input: {
-    workspace_id: string;
-    path: string;
-    name: string;
-    slug: string;
-    domain?: string;
-  },
-): Promise<{ page: { slug: string; url?: string | null } }> {
-  const res = await cloudFetchAsOrgOwner(organizationId, "/api/cloud/pages", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-  if (!res) {
-    throw new Error("Not connected to Openship Cloud — connect your account in Settings.");
-  }
-
-  if (!res.ok) {
-    let detail = `Status ${res.status}`;
-    const body = await readCloudJson<{ error?: string }>(res);
-    if (body?.error) detail = body.error;
-    throw new Error(detail);
-  }
-
-  const body = await readCloudJson<{ page: { slug: string; url?: string | null } }>(res);
-  if (!body) {
-    throw new Error("Cloud returned a non-JSON response when creating the page.");
-  }
-  return body;
-}
-
-// ─── GitHub App proxy (cloud holds the App private key) ─────────────────────
+// ─── GitHub App proxy types (cloud holds the App private key) ───────────────
 //
 // Self-hosted instances never hold GITHUB_APP_ID / GITHUB_PRIVATE_KEY.
 // All App-scoped operations (install URL, list installations, mint install
@@ -388,102 +162,343 @@ export interface CloudGithubUserStatus {
   id?: number;
 }
 
-/**
- * Returns a single-use GitHub OAuth start URL on the SaaS for this user.
- * The local instance opens this URL in a popup; the SaaS handles the
- * entire OAuth round-trip (popup → SaaS oauth-bridge → GitHub OAuth →
- * SaaS Better Auth callback → SaaS oauth-success page). After this
- * completes the SaaS has a `account` row with providerId='github' for
- * the user, and subsequent /user-status and /installations calls work.
- *
- * Returns null when the user isn't connected to Openship Cloud.
- */
-export async function cloudGithubOauthHandoff(
-  userId: string,
-): Promise<{ url: string } | null> {
-  const res = await cloudFetch(userId, "/api/cloud/github/oauth-handoff", {
-    method: "POST",
-  });
-  if (!res || !res.ok) return null;
-  const json = await readCloudJson<{ data: { url: string } }>(res);
-  return json?.data ?? null;
-}
+// ─── Unified cloud client ────────────────────────────────────────────────────
+//
+// The single public surface for talking to the SaaS. Construction takes the
+// scope (userId or organizationId) once; every method below dispatches to the
+// right internal primitive (cloudFetch vs cloudFetchAsOrgOwner) based on that
+// scope.
+//
+// The standalone exports below this section are thin delegations kept around
+// so callers can migrate at their own pace.
 
-/** Returns the GitHub App install URL for the org owner, with a one-time
- *  `state` the cloud will verify on the callback. The local instance opens
- *  this URL in a popup and the cloud attributes the resulting installation
- *  to the org owner so every team member shares access to it. */
-export async function cloudGithubInstallUrl(
-  organizationId: string,
-): Promise<{ url: string; state: string } | null> {
-  const res = await cloudFetchAsOrgOwner(organizationId, "/api/cloud/github/install-url", {
-    method: "POST",
-  });
-  if (!res || !res.ok) return null;
-  const json = await readCloudJson<{ data: { url: string; state: string } }>(res);
-  return json?.data ?? null;
-}
+export type CloudClientScope = { userId: string } | { organizationId: string };
 
-/** List the org's GitHub App installations (the org owner's account on
- *  the SaaS owns them). One SaaS round-trip regardless of org size. */
-export async function cloudGithubInstallations(
-  organizationId: string,
-): Promise<CloudGithubInstallation[] | null> {
-  const res = await cloudFetchAsOrgOwner(organizationId, "/api/cloud/github/installations", {
-    method: "GET",
-  });
-  if (!res || !res.ok) return null;
-  const json = await readCloudJson<{ data: CloudGithubInstallation[] }>(res);
-  return json?.data ?? null;
+export interface CloudClient {
+  github: {
+    installUrl(): Promise<{ url: string; state: string } | null>;
+    oauthHandoff(): Promise<{ url: string } | null>;
+    userStatus(): Promise<CloudGithubUserStatus | null>;
+    installations(): Promise<CloudGithubInstallation[] | null>;
+    installationToken(
+      owner: string,
+      repos?: string[],
+    ): Promise<{ token: string; expiresAt: string } | null>;
+  };
+  pages: {
+    create(input: {
+      workspace_id: string;
+      path: string;
+      name: string;
+      slug: string;
+      domain?: string;
+    }): Promise<{ page: { slug: string; url?: string | null } }>;
+  };
+  edgeProxy: {
+    sync(input: {
+      slug: string;
+      target: string;
+    }): Promise<{ ok: true; hostname: string } | null>;
+  };
+  analytics: {
+    timeseries<T>(domain: string, params?: Record<string, unknown>): Promise<T | null>;
+    requests<T>(domain: string, params?: Record<string, unknown>): Promise<T | null>;
+    streamToken<T>(domain: string, params?: Record<string, unknown>): Promise<T | null>;
+  };
+  preflight(input: {
+    slug?: string;
+    customDomain?: string;
+  }): Promise<CloudPreflightData | null>;
+  account(): Promise<CloudAccount | null>;
+  disconnect(): Promise<void>;
+  token(): Promise<{ token: string; namespace: string } | null>;
 }
-
-/** Mint a short-lived installation access token for cloning the given
- *  owner. Resolves through the org owner so any team member can deploy
- *  using the team's installation. */
-export async function cloudGithubInstallationToken(
-  organizationId: string,
-  input: { installationId?: number; owner: string; repos?: string[] },
-): Promise<CloudGithubInstallationToken | null> {
-  const res = await cloudFetchAsOrgOwner(organizationId, "/api/cloud/github/installation-token", {
-    method: "POST",
-    body: JSON.stringify(input),
-  });
-  if (!res || !res.ok) return null;
-  const json = await readCloudJson<{ data: CloudGithubInstallationToken }>(res);
-  return json?.data ?? null;
-}
-
-/** Cloud-issued OAuth identity for this user (login + avatar). Used by the
- *  dashboard to render "@user" badges on the GitHub settings panel. */
-export async function cloudGithubUserStatus(
-  userId: string,
-): Promise<CloudGithubUserStatus | null> {
-  const res = await cloudFetch(userId, "/api/cloud/github/user-status", {
-    method: "GET",
-  });
-  if (!res || !res.ok) return null;
-  const json = await readCloudJson<{ data: CloudGithubUserStatus }>(res);
-  return json?.data ?? null;
-}
-
-// ─── Billing ─────────────────────────────────────────────────────────────────
 
 /**
- * Proxy a billing request to the SaaS API.
+ * Build a unified cloud client bound to a single identity. All methods on the
+ * returned client dispatch through the appropriate authenticated primitive:
  *
- * Used by local/desktop instances so cloud-connected users can manage
- * their subscription, payment methods, and invoices through the SaaS.
+ *   cloudClient({ userId })          → cloudFetch(userId, …)
+ *   cloudClient({ organizationId })  → cloudFetchAsOrgOwner(orgId, …)
  *
- * Returns the raw Response so the caller can forward status + body.
- * Returns null if the user isn't connected to Openship Cloud.
+ * Methods that look up cached state (token, account) key their cache off the
+ * resolved cloud user id — for org scope, that's the org owner.
  */
-export async function cloudBillingFetch(
-  userId: string,
-  path: string,
-  init?: { method?: string; body?: string },
-): Promise<Response | null> {
-  return cloudFetch(userId, `/api/billing${path}`, {
-    method: init?.method ?? "GET",
-    body: init?.body,
-  });
+export function cloudClient(scope: CloudClientScope): CloudClient {
+  const isUserScope = "userId" in scope;
+
+  /** Authenticated SaaS fetch using the bound scope. */
+  const fetchScoped = (path: string, init?: RequestInit) =>
+    isUserScope
+      ? cloudFetch(scope.userId, path, init)
+      : cloudFetchAsOrgOwner(scope.organizationId, path, init);
+
+  /** Resolve the underlying cloud-linked user id for cache keys. Returns
+   *  null when org scope is used and no member has linked Openship Cloud. */
+  const resolveUserId = async (): Promise<string | null> => {
+    if (isUserScope) return scope.userId;
+    const linked = await repos.settings
+      .findOrgOwnerCloudLink(scope.organizationId)
+      .catch(() => undefined);
+    return linked?.userId ?? null;
+  };
+
+  return {
+    github: {
+      async installUrl() {
+        const res = await fetchScoped("/api/cloud/github/install-url", {
+          method: "POST",
+        });
+        if (!res || !res.ok) return null;
+        const json = await readCloudJson<{ data: { url: string; state: string } }>(res);
+        return json?.data ?? null;
+      },
+      async oauthHandoff() {
+        const res = await fetchScoped("/api/cloud/github/oauth-handoff", {
+          method: "POST",
+        });
+        if (!res || !res.ok) return null;
+        const json = await readCloudJson<{ data: { url: string } }>(res);
+        return json?.data ?? null;
+      },
+      async userStatus() {
+        const res = await fetchScoped("/api/cloud/github/user-status", {
+          method: "GET",
+        });
+        if (!res || !res.ok) return null;
+        const json = await readCloudJson<{ data: CloudGithubUserStatus }>(res);
+        return json?.data ?? null;
+      },
+      async installations() {
+        const res = await fetchScoped("/api/cloud/github/installations", {
+          method: "GET",
+        });
+        if (!res || !res.ok) return null;
+        const json = await readCloudJson<{ data: CloudGithubInstallation[] }>(res);
+        return json?.data ?? null;
+      },
+      async installationToken(owner, repos) {
+        const res = await fetchScoped("/api/cloud/github/installation-token", {
+          method: "POST",
+          body: JSON.stringify({ owner, repos }),
+        });
+        if (!res || !res.ok) return null;
+        const json = await readCloudJson<{ data: CloudGithubInstallationToken }>(res);
+        return json?.data ?? null;
+      },
+    },
+
+    pages: {
+      async create(input) {
+        const res = await fetchScoped("/api/cloud/pages", {
+          method: "POST",
+          body: JSON.stringify(input),
+        });
+        if (!res) {
+          throw new Error(
+            "Not connected to Openship Cloud — connect your account in Settings.",
+          );
+        }
+        if (!res.ok) {
+          let detail = `Cloud page creation failed: HTTP ${res.status}`;
+          const body = await readCloudJson<{ error?: string }>(res);
+          if (body?.error) detail = body.error;
+          throw new Error(detail);
+        }
+        const body = await readCloudJson<{ page: { slug: string; url?: string | null } }>(res);
+        if (!body) {
+          throw new Error(
+            "Cloud returned a non-JSON response when creating the page.",
+          );
+        }
+        return body;
+      },
+    },
+
+    edgeProxy: {
+      async sync(input) {
+        const res = await fetchScoped("/api/cloud/edge-proxy", {
+          method: "POST",
+          body: JSON.stringify(input),
+        });
+        if (!res) return null;
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          throw new Error(`Edge proxy sync failed (${res.status}): ${text}`);
+        }
+        const body = await readCloudJson<{ ok: true; hostname: string }>(res);
+        return body ?? null;
+      },
+    },
+
+    analytics: {
+      async timeseries<T>(domain: string, params?: Record<string, unknown>) {
+        const res = await fetchScoped("/api/cloud/analytics", {
+          method: "POST",
+          body: JSON.stringify({ operation: "timeseries", domain, params }),
+        });
+        if (!res?.ok) return null;
+        return readCloudJson<T>(res);
+      },
+      async requests<T>(domain: string, params?: Record<string, unknown>) {
+        const res = await fetchScoped("/api/cloud/analytics", {
+          method: "POST",
+          body: JSON.stringify({ operation: "requests", domain, params }),
+        });
+        if (!res?.ok) return null;
+        return readCloudJson<T>(res);
+      },
+      async streamToken<T>(domain: string, params?: Record<string, unknown>) {
+        const res = await fetchScoped("/api/cloud/analytics", {
+          method: "POST",
+          body: JSON.stringify({ operation: "streamToken", domain, params }),
+        });
+        if (!res?.ok) return null;
+        return readCloudJson<T>(res);
+      },
+    },
+
+    async preflight(input) {
+      const res = await fetchScoped("/api/cloud/preflight", {
+        method: "POST",
+        body: JSON.stringify(input),
+      });
+      if (!res || !res.ok) return null;
+      const json = await readCloudJson<{ data: CloudPreflightData }>(res);
+      return json?.data ?? null;
+    },
+
+    async account() {
+      const res = await fetchScoped("/api/cloud/account", { method: "GET" });
+      if (!res || !res.ok) return null;
+      const json = await readCloudJson<{ user?: CloudAccount }>(res);
+      return json?.user ?? null;
+    },
+
+    async disconnect() {
+      // Only meaningful at user scope — there is no "org-level" SaaS session
+      // to revoke. For org scope we resolve the linked owner and disconnect
+      // them; this mirrors the org→owner pattern used elsewhere.
+      const userId = await resolveUserId();
+      if (!userId) return;
+      try {
+        const res = await cloudFetch(userId, "/api/cloud/disconnect", {
+          method: "POST",
+        });
+        if (res && !res.ok) {
+          console.warn(
+            `[cloud disconnect] SaaS returned ${res.status} on session revoke; clearing local anyway`,
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `[cloud disconnect] SaaS revoke failed (clearing local anyway):`,
+          safeErrorMessage(err),
+        );
+      }
+      await repos.settings.update(userId, { cloudSessionToken: null });
+      const [tokens, statuses] = await Promise.all([
+        cacheStore<TokenCache>("oblien-ns-tokens"),
+        cacheStore<CloudAccount>("cloud-status"),
+      ]);
+      await Promise.all([tokens.delete(userId), statuses.delete(userId)]);
+    },
+
+    async token() {
+      const userId = await resolveUserId();
+      if (!userId) return null;
+      const store = await cacheStore<TokenCache>("oblien-ns-tokens");
+      const cached = await store.get(userId);
+      if (cached) return cached;
+
+      const res = await cloudFetch(userId, "/api/cloud/token", { method: "POST" });
+      if (!res || !res.ok) return null;
+
+      const json = await readCloudJson<{
+        data: { token: string; namespace: string; expiresAt: string };
+      }>(res);
+      if (!json?.data) return null;
+
+      const entry: TokenCache = { token: json.data.token, namespace: json.data.namespace };
+      await store.set(userId, entry, TOKEN_TTL_S);
+      return entry;
+    },
+  };
 }
+
+// ─── Cloud session management ────────────────────────────────────────────────
+
+/**
+ * Check whether the user has a stored cloud session.
+ */
+export async function isCloudConnected(userId: string): Promise<boolean> {
+  const settings = await repos.settings.findByUser(userId);
+  return !!settings?.cloudSessionToken;
+}
+
+export async function invalidateCloudStatusCache(userId: string): Promise<void> {
+  const store = await cacheStore<CloudAccount>("cloud-status");
+  await store.delete(userId);
+}
+
+/**
+ * Resolve cloud connection state for the local user. The presence of
+ * `cloudSessionToken` in user_settings IS the connection — no SaaS
+ * round-trip needed to verify it. The /account fetch ONLY runs to
+ * surface profile data (name/email/avatar); result cached for 5min
+ * via the shared CacheStore. A 401 on the cached call drops the
+ * cache and marks disconnected lazily.
+ */
+export async function getCloudConnectionStatus(
+  userId: string,
+): Promise<{ connected: boolean; user?: CloudAccount }> {
+  const settings = await repos.settings.findByUser(userId);
+  const store = await cacheStore<CloudAccount>("cloud-status");
+  if (!settings?.cloudSessionToken) {
+    await store.delete(userId);
+    return { connected: false };
+  }
+
+  const cached = await store.get(userId);
+  if (cached) {
+    return { connected: true, user: cached };
+  }
+
+  const res = await cloudFetch(userId, "/api/cloud/account", { method: "GET" });
+  if (res?.status === 401) {
+    await store.delete(userId);
+    return { connected: false };
+  }
+
+  const user = res?.ok
+    ? (await readCloudJson<{ user?: CloudAccount }>(res))?.user
+    : undefined;
+  // Only cache positive responses. The OLD code had no cache; caching a
+  // null/undefined user here would be indistinguishable from a cache miss
+  // on subsequent reads (store.get returns null in both cases), so we skip
+  // the write when there's nothing meaningful to cache.
+  if (user) {
+    await store.set(userId, user, STATUS_TTL_S);
+  }
+  return { connected: true, ...(user ? { user } : {}) };
+}
+
+// ─── Namespace token fetching ────────────────────────────────────────────────
+
+/**
+ * Org-scoped cloud-token lookup. Returns the owner's cloud token —
+ * only the owner can link Openship Cloud, and their connection is the
+ * org's cloud identity for every member to use under the hood.
+ */
+export async function getOrgCloudToken(
+  organizationId: string,
+): Promise<{ token: string; namespace: string; userId: string } | null> {
+  const settings = await repos.settings
+    .findOrgOwnerCloudLink(organizationId)
+    .catch(() => undefined);
+  if (!settings) return null;
+  const token = await cloudClient({ userId: settings.userId }).token();
+  if (!token) return null;
+  return { ...token, userId: settings.userId };
+}
+

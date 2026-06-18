@@ -28,7 +28,11 @@ type EnsureProjectBody = TCreateProjectBody & { projectId?: string };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/** Enrich a project row with computed fields */
+/** Enrich a project row with computed fields. `deployTarget` is the
+ *  only signal the dashboard needs — `deployTarget === "cloud"` IS
+ *  the cloud-project test; the dashboard combines it with its own
+ *  CloudContext.connected state to decide whether to render the
+ *  "Reconnect Openship Cloud" gate. No duplicate booleans here. */
 export async function enrichProject(p: Project) {
   const production = p.resources as ResourceConfig | null;
   const build = p.buildResources as ResourceConfig | null;

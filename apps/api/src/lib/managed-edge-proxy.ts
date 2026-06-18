@@ -1,4 +1,4 @@
-import { syncEdgeProxy } from "./cloud-client";
+import { cloudClient } from "./cloud-client";
 import { resolveServerHost } from "./server-target";
 
 /**
@@ -20,5 +20,10 @@ export async function ensureManagedEdgeProxy(
   if (!target) {
     throw new Error("Cannot configure edge proxy: target host could not be resolved");
   }
-  await syncEdgeProxy(organizationId, slug, target);
+  const result = await cloudClient({ organizationId }).edgeProxy.sync({ slug, target });
+  if (!result) {
+    throw new Error(
+      "Cannot sync edge proxy: no member of this organization has linked Openship Cloud",
+    );
+  }
 }

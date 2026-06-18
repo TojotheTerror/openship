@@ -1,16 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getCloudConnectHandoffUrl } from "./lib/cloud-auth";
 
-/**
- * Lightweight middleware - checks cookie existence only.
- *
- * Does NOT validate the session (no fetch to API).
- * Actual session validation happens server-side in the
- * (dashboard) layout via `getSession()`.
- *
- * This gives instant redirects for obviously-unauthenticated users
- * (no cookie at all) without adding latency or API dependency.
- */
+// Cookie presence only — never proof of a valid session. Server-side
+// `getSession()` in (dashboard) layout is the real authoritative
+// check; this middleware just short-circuits the obviously-unauthed
+// case to skip the layout fetch.
 
 const PUBLIC_ROUTES = [
   "/login",
@@ -22,43 +15,26 @@ const PUBLIC_ROUTES = [
   "/onboarding",
 ];
 
-/** Better Auth session cookie - prefix varies by API mode */
 const SESSION_COOKIE_SUFFIX = ".session_token";
 
 export function proxy(req: NextRequest) {
-  const { pathname, searchParams } = req.nextUrl;
+  const { pathname, search } = req.nextUrl;
   const isPublic = PUBLIC_ROUTES.some((r) => pathname.startsWith(r));
   const hasCookie = req.cookies.getAll().some((c) => c.name.endsWith(SESSION_COOKIE_SUFFIX));
 
-  // No cookie + protected route → redirect to login
   if (!hasCookie && !isPublic) {
     const url = new URL("/login", req.url);
     url.searchParams.set("from", pathname);
     return NextResponse.redirect(url);
   }
 
-  // Already authenticated + hitting /login with a callback → skip login form.
-  // Self-hosted "Connect to Cloud" opens /login?callback=... on SaaS;
-  // if user is already logged in there, forward straight to the handoff.
-  if (hasCookie && pathname === "/login" && searchParams.has("callback")) {
-    const callback = searchParams.get("callback")!;
-    const flow = searchParams.get("flow");
-
-    if (flow === "desktop-cloud") {
-      // Desktop PKCE flow → forward to /authorize with all params
-      const url = new URL("/authorize", req.url);
-      searchParams.forEach((v, k) => url.searchParams.set(k, v));
-      return NextResponse.redirect(url);
-    }
-
-    // Self-hosted connect flow → go straight to handoff endpoint
-    return NextResponse.redirect(getCloudConnectHandoffUrl(callback));
-  }
-
-  // Cookie + public route → let auth layout handle the redirect
-  // (it validates the session server-side; stale cookies won't loop)
-
-  return NextResponse.next();
+  // Stamp the pathname+search onto a request header so server layouts
+  // can read query params (layouts don't receive `searchParams` in App
+  // Router). (auth)/layout.tsx uses this to honor a `callback=` on
+  // /login when the user already has a SaaS session.
+  const requestHeaders = new Headers(req.headers);
+  requestHeaders.set("x-pathname-with-search", `${pathname}${search}`);
+  return NextResponse.next({ request: { headers: requestHeaders } });
 }
 
 export const config = {

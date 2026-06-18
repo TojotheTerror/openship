@@ -3,10 +3,25 @@ import { getOblienClient, issueNamespaceToken } from "./openship-cloud";
 import { getRoutingBaseDomain } from "./routing-domains";
 import { safeErrorMessage } from "@repo/core";
 
+/** DNS verification state + required records for a custom domain. */
+export interface CustomDomainCheck {
+  verified: boolean;
+  /** Routing (CNAME or A) record points at Oblien's edge. */
+  cname?: boolean;
+  /** Ownership TXT challenge observed. */
+  ownership?: boolean;
+  message?: string;
+  /** Records the user must add. Dashboard renders copy-paste cards. */
+  requiredRecords?: {
+    cname?: { host: string; target: string };
+    txt?: { host: string; value: string };
+  };
+}
+
 export interface CloudPreflightData {
   runtime: { ok: boolean; message?: string };
   slug?: { available: boolean; message?: string };
-  customDomain?: { verified: boolean; message?: string };
+  customDomain?: CustomDomainCheck;
 }
 
 /**
@@ -36,7 +51,7 @@ export interface CloudPreflightData {
  * minutes in a build that ends with "slug already taken."
  */
 export async function runCloudPreflight(
-  userId: string,
+  organizationId: string,
   opts: { slug?: string; customDomain?: string },
 ): Promise<CloudPreflightData> {
   const baseDomain = getRoutingBaseDomain();
@@ -45,7 +60,7 @@ export async function runCloudPreflight(
   let cloud: CloudRuntime | null = null;
   let runtimeError: string | null = null;
   try {
-    const token = await issueNamespaceToken(userId);
+    const token = await issueNamespaceToken(organizationId);
     const cloudPlatform = await createPlatform({ target: "cloud", cloudToken: token.token });
     cloud = cloudPlatform.runtime as CloudRuntime;
     await cloud.getQuota();
@@ -86,14 +101,40 @@ export async function runCloudPreflight(
   if (opts.customDomain && cloud) {
     try {
       const verified = await cloud.verifyDomain(opts.customDomain);
-      result.customDomain = verified.verified
-        ? { verified: true }
-        : {
-            verified: false,
-            message: verified.errors.length > 0
-              ? verified.errors.join("; ")
-              : `DNS not configured for ${opts.customDomain}. Add a CNAME record pointing to ${verified.requiredRecords.cname.target}`,
-          };
+      if (verified.verified) {
+        result.customDomain = {
+          verified: true,
+          cname: verified.cname ?? undefined,
+          ownership: verified.ownership ?? undefined,
+        };
+      } else {
+        // Build an actionable message from Oblien's errors AND surface
+        // BOTH cname + txt required-records. Previously only cname was
+        // mentioned — users hit "DNS not verifying" with no idea the
+        // TXT ownership record was also missing.
+        const cnameMissing = verified.cname === false;
+        const ownershipMissing = verified.ownership === false;
+        const missing: string[] = [];
+        if (cnameMissing && verified.requiredRecords.cname) {
+          missing.push(`CNAME ${verified.requiredRecords.cname.host} → ${verified.requiredRecords.cname.target}`);
+        }
+        if (ownershipMissing && verified.requiredRecords.txt) {
+          missing.push(`TXT ${verified.requiredRecords.txt.host} = ${verified.requiredRecords.txt.value}`);
+        }
+        const baseMessage = verified.errors.length > 0
+          ? verified.errors.join("; ")
+          : `DNS not configured for ${opts.customDomain}.`;
+        const message = missing.length > 0
+          ? `${baseMessage} Add: ${missing.join("  AND  ")}`
+          : baseMessage;
+        result.customDomain = {
+          verified: false,
+          cname: verified.cname ?? undefined,
+          ownership: verified.ownership ?? undefined,
+          message,
+          requiredRecords: verified.requiredRecords,
+        };
+      }
     } catch (err) {
       const message = safeErrorMessage(err);
       console.error("[CLOUD] Preflight custom domain check failed", { domain: opts.customDomain, error: message });

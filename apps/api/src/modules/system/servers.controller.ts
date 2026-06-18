@@ -94,7 +94,7 @@ export async function createServer(c: Context) {
   });
 
   sshManager.invalidate(server.id);
-  invalidateOpenRestyPaths(server.id);
+  await invalidateOpenRestyPaths(server.id);
 
   // Names + non-secret connection details only. SSH passwords & key
   // passphrases are encrypted at rest; never include them in the audit.
@@ -149,7 +149,7 @@ export async function updateServer(c: Context) {
 
   const updated = await repos.server.update(id, patch);
   sshManager.invalidate(id);
-  invalidateOpenRestyPaths(id);
+  await invalidateOpenRestyPaths(id);
 
   // Audit only the fields the caller intended to touch. Skip secrets entirely.
   const auditAfter: Record<string, unknown> = {};
@@ -203,7 +203,7 @@ export async function deleteServer(c: Context) {
       console.error("[server.delete] mail_server grant cleanup failed:", err),
     );
   sshManager.invalidate(id);
-  invalidateOpenRestyPaths(id);
+  await invalidateOpenRestyPaths(id);
 
   audit.recordAsync(auditContextFrom(c, organizationId, userId), {
     eventType: "server.removed",

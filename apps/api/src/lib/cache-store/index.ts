@@ -4,7 +4,7 @@
  * Mirrors the job-runner pattern: probe Redis once, share the
  * decision + connection across all callers in this process.
  *
- *   await createCacheStore<string>("gh-tokens", { maxSize: 5000 })
+ *   await cacheStore<string>("gh-tokens", { maxSize: 5000 })
  *
  * Returns a Redis-backed store when REDIS_URL is reachable; a
  * MemoryCacheStore otherwise. Self-hosted PGlite installs never run
@@ -30,6 +30,15 @@ let backendDecision: Backend | null = null;
 let resolvingPromise: Promise<Backend> | null = null;
 let sharedRedis: IORedis | null = null;
 const trackedStores = new Set<CacheStore<unknown>>();
+
+/**
+ * Memoize stores by namespace so two call sites with the same name
+ * share one store. Without this, `await cacheStore("foo")` in
+ * different files would each get a fresh MemoryCacheStore on memory
+ * mode → cached entries invisible to siblings. Idempotency is what
+ * makes the await-at-use-site pattern correct.
+ */
+const storesByNamespace = new Map<string, Promise<CacheStore<unknown>>>();
 
 async function isRedisReachable(timeoutMs = 2000): Promise<boolean> {
   const probe = new IORedis(env.REDIS_URL, {
@@ -89,31 +98,34 @@ function getSharedRedis(): IORedis {
 }
 
 /**
- * Create a namespaced CacheStore. `namespace` MUST be unique per
- * logical cache (e.g. `"gh-tokens"`, `"oauth-bridges"`); two callers
- * with the same namespace share keyspace on Redis and share a
- * TtlCache instance on memory mode.
+ * Get the CacheStore for `namespace`. Idempotent — two call sites
+ * with the same name share one store (so memory-mode entries are
+ * visible across consumers, matching Redis-mode semantics). Use
+ * directly at call site:
  *
- * Note that on memory mode, each call returns a NEW MemoryCacheStore.
- * That's fine because each consumer module owns its own cache anyway
- * (the legacy TtlCache behaviour). Cross-namespace isolation is the
- * concern that matters; Redis enforces it via prefix, memory enforces
- * it by simply not sharing the Map.
+ *   const store = await cacheStore<TokenCache>("oblien-ns-tokens");
+ *   await store.set(userId, token, 1500);
  */
-export async function createCacheStore<T>(
+export function cacheStore<T>(
   namespace: string,
   opts: CacheStoreOptions = {},
 ): Promise<CacheStore<T>> {
   if (!namespace || namespace.includes(" ")) {
-    throw new Error(`createCacheStore: invalid namespace "${namespace}"`);
+    throw new Error(`cacheStore: invalid namespace "${namespace}"`);
   }
-  const backend = await resolveBackend();
-  const store: CacheStore<T> =
-    backend === "redis"
-      ? new RedisCacheStore<T>(getSharedRedis(), namespace)
-      : new MemoryCacheStore<T>(opts);
-  trackedStores.add(store as CacheStore<unknown>);
-  return store;
+  const existing = storesByNamespace.get(namespace);
+  if (existing) return existing as Promise<CacheStore<T>>;
+  const promise = (async () => {
+    const backend = await resolveBackend();
+    const store: CacheStore<T> =
+      backend === "redis"
+        ? new RedisCacheStore<T>(getSharedRedis(), namespace)
+        : new MemoryCacheStore<T>(opts);
+    trackedStores.add(store as CacheStore<unknown>);
+    return store;
+  })();
+  storesByNamespace.set(namespace, promise as Promise<CacheStore<unknown>>);
+  return promise;
 }
 
 /** Active backend choice — null if no store has been created yet. */
@@ -132,6 +144,7 @@ export async function shutdownCacheStores(): Promise<void> {
     }
   }
   trackedStores.clear();
+  storesByNamespace.clear();
   if (sharedRedis) {
     try {
       sharedRedis.disconnect();

@@ -27,13 +27,10 @@ function getUserId(c: Context): string {
 }
 
 /**
- * Extract the active organization id from context (set by
- * activeOrganizationMiddleware mounted in github.routes.ts).
- *
- * Threaded into every `githubService.*` call so the operator-only
- * gh-cli gate in `tokenFor` knows whether the caller has `owner` role.
- * Returns undefined defensively — middleware should always have set it,
- * but unsetting it falls back rather than 500-ing on a misconfigured route.
+ * Active org id from context (set by `authMiddleware`). Threaded into
+ * every `githubService.*` call so the operator-only gh-cli gate in
+ * `tokenFor` knows whether the caller has `owner` role. Defensive
+ * undefined return — never 500 if a route forgot the middleware.
  */
 function orgId(c: Context): string | undefined {
   const v = c.get("activeOrganizationId");
@@ -87,9 +84,14 @@ export async function getStatus(c: Context) {
 export async function getHome(c: Context) {
   const userId = getUserId(c);
   const data = await githubService.getUserHome(userId);
+  // Per-user resolution — in cloud-app mode this round-trips through
+  // api.openship.io for a state-bound URL so the install can be
+  // attributed back to this user; otherwise returns the static GitHub
+  // install URL.
+  const { url: installUrl } = await githubAuth.resolveInstallUrl(userId);
   return c.json({
     ...data,
-    installUrl: githubAuth.getInstallUrl(),
+    installUrl,
   });
 }
 
@@ -240,10 +242,11 @@ export async function connect(c: Context) {
     if (installations.length > 0) {
       return c.json({ connected: true });
     }
+    const { url } = await githubAuth.resolveInstallUrl(userId);
     return c.json({
       connected: false,
       flow: "redirect" as const,
-      url: githubAuth.getInstallUrl(),
+      url,
     });
   }
 
@@ -268,10 +271,11 @@ export async function connect(c: Context) {
       return c.json({ connected: true });
     }
 
+    const { url } = await githubAuth.resolveInstallUrl(userId);
     return c.json({
       connected: false,
       flow: "redirect" as const,
-      url: githubAuth.getInstallUrl(),
+      url,
     });
   }
 

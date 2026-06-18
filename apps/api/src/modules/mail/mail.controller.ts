@@ -28,6 +28,7 @@ import type { Context } from "hono";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { streamSSE } from "../../lib/sse";
 import { env } from "../../config";
+import { safeErrorMessage } from "@repo/core";
 import { sshManager } from "../../lib/ssh-manager";
 import { repos } from "@repo/db";
 import { getActiveOrganizationId } from "../../lib/controller-helpers";
@@ -342,7 +343,7 @@ export async function listMailServers(c: Context) {
       } catch (err) {
         console.warn(
           "[mail] backfill upsert failed:",
-          err instanceof Error ? err.message : err,
+          safeErrorMessage(err),
         );
       }
     }
@@ -559,7 +560,7 @@ export async function startSetup(c: Context) {
   } catch (err) {
     console.warn(
       "[mail] failed to record mail-server install start:",
-      err instanceof Error ? err.message : err,
+      safeErrorMessage(err),
     );
   }
 
@@ -814,7 +815,7 @@ export async function startSetup(c: Context) {
       } catch (err) {
         console.warn(
           "[mail] failed to stamp installedAt on mail-server record:",
-          err instanceof Error ? err.message : err,
+          safeErrorMessage(err),
         );
       }
 
@@ -1003,7 +1004,7 @@ export async function resetSetup(c: Context) {
   } catch (err) {
     console.warn(
       "[mail] failed to drop mail-server record after reset:",
-      err instanceof Error ? err.message : err,
+      safeErrorMessage(err),
     );
   }
   return c.json({ ok: true });

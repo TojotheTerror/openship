@@ -32,27 +32,19 @@ interface ProjectOptions {
 }
 
 interface BasicProjectData {
-  // `id` and `slug` are required because consumers pass them straight to
-  // projectsApi as primary keys; treating them as optional would force
-  // every callsite to handle `undefined`. They default to "" in the
-  // pre-fetch initial state and get populated by `useProjectInfo`.
   id: string;
   slug: string;
   name: string;
   description: string;
   framework: string;
-  // Fields populated by `useProjectInfo` from /projects/:id/info.
   options?: ProjectOptions;
   domains?: ProjectDomain[];
   buildImage?: string;
   hasMultipleServices?: boolean;
   serviceCount?: number;
   activeDeploymentId?: string | null;
-  // Per-project deploy target — independent of the dashboard install mode.
-  // "cloud" = deployed to openship cloud; "server" = remote VPS; "local" =
-  // user's own machine. Consumers gate behavior on this (e.g. AddServiceModal
-  // hides the local-image catalog for cloud projects).
   deployTarget?: "cloud" | "server" | "local";
+  cloudWorkspaceId?: string | null;
   deletedAt?: string | null;
   packageManager?: string;
   [key: string]: any;

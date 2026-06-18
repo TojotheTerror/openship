@@ -5,7 +5,7 @@
  */
 
 import Stripe from "stripe";
-import { AppError, PLANS, ANNUAL_DISCOUNT, type PlanId } from "@repo/core";
+import { AppError, PLANS, ANNUAL_DISCOUNT, safeErrorMessage, type PlanId } from "@repo/core";
 import { repos } from "@repo/db";
 import { env, runtimeTarget } from "../../config/env";
 
@@ -196,7 +196,7 @@ export async function handleStripeEvent(rawBody: string, signature?: string) {
       .catch((err) =>
         console.warn(
           "[billing] webhook audit emit failed:",
-          err instanceof Error ? err.message : err,
+          safeErrorMessage(err),
         ),
       );
   } else {

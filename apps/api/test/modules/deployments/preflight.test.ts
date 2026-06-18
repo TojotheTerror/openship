@@ -1,20 +1,25 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { getCloudPreflight, runCloudPreflight } = vi.hoisted(() => ({
-  getCloudPreflight: vi.fn(),
+const { cloudClient, runCloudPreflight, preflightFn } = vi.hoisted(() => ({
+  cloudClient: vi.fn(),
   runCloudPreflight: vi.fn(),
+  preflightFn: vi.fn(),
 }));
 
-vi.mock("@repo/db", () => ({
-  repos: {},
-}));
+vi.mock("@repo/db", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@repo/db")>();
+  return {
+    ...actual,
+    repos: {},
+  };
+});
 
 vi.mock("../../../src/lib/controller-helpers", () => ({
   platform: () => ({ target: "desktop" }),
 }));
 
 vi.mock("../../../src/lib/cloud-client", () => ({
-  getCloudPreflight,
+  cloudClient,
 }));
 
 vi.mock("../../../src/lib/cloud-preflight", () => ({
@@ -26,8 +31,9 @@ import { runPreflightChecks } from "../../../src/modules/deployments/preflight";
 describe("runPreflightChecks", () => {
   beforeEach(() => {
     runCloudPreflight.mockReset();
-    getCloudPreflight.mockReset();
-    getCloudPreflight.mockImplementation(async (_userId: string, input: { slug?: string }) => ({
+    cloudClient.mockReset();
+    preflightFn.mockReset();
+    preflightFn.mockImplementation(async (input: { slug?: string }) => ({
       runtime: { ok: true },
       slug: input.slug
         ? {
@@ -38,6 +44,10 @@ describe("runPreflightChecks", () => {
           }
         : undefined,
     }));
+    cloudClient.mockReturnValue({ preflight: preflightFn } as any);
+    runCloudPreflight.mockImplementation(async (_userId: string, input: { slug?: string }) =>
+      preflightFn(input),
+    );
   });
 
   it("checks free-domain availability for every public endpoint", async () => {
@@ -52,8 +62,11 @@ describe("runPreflightChecks", () => {
       hasBuild: true,
       hasServer: true,
       deployTarget: "server",
+      organizationId: "org-1",
     } as any, {
       userId: "user-1",
+      organizationId: "org-1",
+      buildStrategy: "local",
       publicEndpoints: [
         { port: 3000, domain: "taken-endpoint", domainType: "free" },
         { port: 4000, domain: "ok-endpoint", domainType: "free" },
@@ -74,10 +87,10 @@ describe("runPreflightChecks", () => {
       ]),
     );
     expect(
-      getCloudPreflight.mock.calls.some(([, input]) => input && input.slug === "taken-endpoint"),
+      preflightFn.mock.calls.some(([input]) => input && input.slug === "taken-endpoint"),
     ).toBe(true);
     expect(
-      getCloudPreflight.mock.calls.some(([, input]) => input && input.slug === "ok-endpoint"),
+      preflightFn.mock.calls.some(([input]) => input && input.slug === "ok-endpoint"),
     ).toBe(true);
   });
 
@@ -93,8 +106,11 @@ describe("runPreflightChecks", () => {
       hasBuild: true,
       hasServer: false,
       deployTarget: "cloud",
+      organizationId: "org-1",
     } as any, {
       userId: "user-1",
+      organizationId: "org-1",
+      buildStrategy: "local",
       publicEndpoints: [
         { targetPath: "/docs", domain: "docs-site", domainType: "free" },
       ],

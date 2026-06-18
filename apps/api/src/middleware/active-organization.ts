@@ -61,37 +61,6 @@ export async function resolveActiveOrganizationId(
 }
 
 /**
- * Middleware variant — sets `activeOrganizationId` on context, 403s
- * when the user has no memberships at all (provisionUser failed).
- *
- * Runs AFTER authMiddleware (assumes c.get("user") + c.get("session")).
- * Used by routes that need org context outside the standard
- * authMiddleware path (e.g. GitHub webhook handlers).
- */
-export async function activeOrganizationMiddleware(c: Context, next: Next) {
-  const user = c.get("user") as { id: string } | undefined;
-  const session = c.get("session") as { activeOrganizationId?: string | null } | undefined;
-
-  if (!user?.id) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
-  const orgId = await resolveActiveOrganizationId(
-    user.id,
-    session?.activeOrganizationId ?? null,
-  );
-  if (!orgId) {
-    return c.json(
-      { error: "No organization membership", code: "NO_ACTIVE_ORGANIZATION" },
-      403,
-    );
-  }
-
-  c.set("activeOrganizationId", orgId);
-  await next();
-}
-
-/**
  * Role-gated middleware factory. Use on admin/owner-only routes:
  *   members.use("/invite", requireRole("admin"));
  *

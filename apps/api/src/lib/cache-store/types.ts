@@ -14,7 +14,7 @@
  *
  * Every caller (GitHub token cache, future session caches, etc.) talks
  * to the interface — none knows which backend is live. The probe +
- * selection happens once at first `createCacheStore` call, mirroring
+ * selection happens once at first `cacheStore` call, mirroring
  * the job-runner module pattern.
  *
  * Keys are namespaced by the `namespace` arg at create time so two

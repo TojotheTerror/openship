@@ -26,6 +26,7 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { repos, type Project } from "@repo/db";
+import { safeErrorMessage } from "@repo/core";
 import { sshManager } from "../../../lib/ssh-manager";
 import { assertResourceInOrg } from "../../../lib/controller-helpers";
 import {
@@ -225,7 +226,7 @@ export async function markWebmailInstalled(
     }
   } catch (err) {
     console.warn(
-      `[webmail] could not flip installed=true for ${mailServerId}: ${err instanceof Error ? err.message : err}`,
+      `[webmail] could not flip installed=true for ${mailServerId}: ${safeErrorMessage(err)}`,
     );
   }
 }
@@ -298,7 +299,7 @@ export async function cleanupWebmailInstall(input: {
     });
   } catch (err) {
     console.warn(
-      `[webmail] could not read mail-state on ${input.mailServerId}: ${err instanceof Error ? err.message : err}`,
+      `[webmail] could not read mail-state on ${input.mailServerId}: ${safeErrorMessage(err)}`,
     );
   }
 
@@ -310,7 +311,7 @@ export async function cleanupWebmailInstall(input: {
       });
     } catch (err) {
       console.warn(
-        `[webmail] could not remove branding dir on ${targetServerId}: ${err instanceof Error ? err.message : err}`,
+        `[webmail] could not remove branding dir on ${targetServerId}: ${safeErrorMessage(err)}`,
       );
     }
   }
@@ -326,7 +327,7 @@ export async function cleanupWebmailInstall(input: {
     });
   } catch (err) {
     console.warn(
-      `[webmail] could not clear mail-state webmail block on ${input.mailServerId}: ${err instanceof Error ? err.message : err}`,
+      `[webmail] could not clear mail-state webmail block on ${input.mailServerId}: ${safeErrorMessage(err)}`,
     );
   }
 }

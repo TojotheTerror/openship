@@ -5,31 +5,34 @@ import {
 } from "@repo/adapters";
 import type { CommandExecutor } from "@repo/adapters";
 import { sshManager } from "./ssh-manager";
+import { cacheStore } from "./cache-store";
 
-const openRestyPathCache = new Map<string, OpenRestyPaths>();
+// 1h TTL — OpenResty path layout is effectively immutable per server,
+// but cap it so a redeploy that moves nginx is caught within the hour.
+const OPENRESTY_PATH_TTL_S = 60 * 60;
 
 export async function getOpenRestyPaths(
   serverId: string,
   executor: CommandExecutor,
   forceRefresh = false,
 ): Promise<OpenRestyPaths> {
-  const cached = !forceRefresh ? openRestyPathCache.get(serverId) : null;
-  if (cached) {
-    return cached;
+  const store = await cacheStore<OpenRestyPaths>("openresty-paths");
+  if (!forceRefresh) {
+    const cached = await store.get(serverId);
+    if (cached) return cached;
   }
-
   const detected = await detectOpenRestyPaths(executor);
-  openRestyPathCache.set(serverId, detected);
+  await store.set(serverId, detected, OPENRESTY_PATH_TTL_S);
   return detected;
 }
 
-export function invalidateOpenRestyPaths(serverId?: string): void {
+export async function invalidateOpenRestyPaths(serverId?: string): Promise<void> {
+  const store = await cacheStore<OpenRestyPaths>("openresty-paths");
   if (serverId) {
-    openRestyPathCache.delete(serverId);
+    await store.delete(serverId);
     return;
   }
-
-  openRestyPathCache.clear();
+  await store.invalidateByPrefix("");
 }
 
 export async function withOpenRestyRouting<T>(
@@ -46,11 +49,9 @@ export async function withOpenRestyRouting<T>(
     try {
       return await run(false);
     } catch (err) {
-      if (!openRestyPathCache.has(serverId)) {
-        throw err;
-      }
-
-      invalidateOpenRestyPaths(serverId);
+      const store = await cacheStore<OpenRestyPaths>("openresty-paths");
+      if (!(await store.get(serverId))) throw err;
+      await store.delete(serverId);
       return run(true);
     }
   });

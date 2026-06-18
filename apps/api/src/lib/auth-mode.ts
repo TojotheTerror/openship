@@ -1,5 +1,5 @@
 /**
- * Cached auth-mode reader for desktop mode.
+ * Cached auth-mode reader.
  *
  * Auth mode is written once during onboarding and rarely changes.
  * Caching avoids a DB hit on every request through authMiddleware.
@@ -15,22 +15,31 @@ let cached: string | null = null;
 /**
  * Returns the current auth mode for this instance.
  *
- *   "none"  → zero-auth desktop (auto-provisioned local user)
+ *   "none"  → zero-auth (auto-provisioned local user, no login required)
  *   "cloud" → cloud-authenticated desktop (Openship Cloud session)
- *   "local" → standard Better Auth (self-hosted VPS / SaaS)
+ *   "local" → standard Better Auth (login required)
+ *
+ * "none" is valid for any DEPLOY_MODE — the operator opts in via the
+ * settings endpoint, which is itself gated by OPENSHIP_ALLOW_ZERO_AUTH=true.
+ * The safety guardrail that restricts zero-auth to loopback connections is
+ * enforced downstream in authMiddleware, not here.
+ *
+ * Defaults when no instanceSettings.authMode value has been written:
+ *   - DEPLOY_MODE=desktop → "none"  (loopback-only Electron, safe by default)
+ *   - any other mode      → "local" (require login on a fresh self-hosted install)
  */
 export async function getAuthMode(): Promise<"none" | "cloud" | "local"> {
-  // Non-desktop always uses local Better Auth
-  if (env.DEPLOY_MODE !== "desktop") return "local";
-
   if (cached !== null) return cached as "none" | "cloud" | "local";
+
+  const fallback: "none" | "local" =
+    env.DEPLOY_MODE === "desktop" ? "none" : "local";
 
   try {
     const { repos } = await import("@repo/db");
     const settings = await repos.instanceSettings.get();
-    cached = settings?.authMode ?? "none";
+    cached = settings?.authMode ?? fallback;
   } catch {
-    cached = "none";
+    cached = fallback;
   }
 
   return cached as "none" | "cloud" | "local";

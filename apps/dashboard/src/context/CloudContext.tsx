@@ -11,7 +11,8 @@ import {
 } from "react";
 import { Cloud, ExternalLink, X, Rocket, Shield, Globe, Zap, Loader2 } from "lucide-react";
 import { cloudApi } from "@/lib/api";
-import { getApiOrigin, getCloudDashboardUrl } from "@/lib/api/urls";
+import { getApiOrigin } from "@/lib/api/urls";
+import { getCloudConnectHandoffUrl } from "@/lib/cloud-auth";
 import { canUseCloudConnection, usePlatform } from "@/context/PlatformContext";
 import { Button } from "@/components/ui/button";
 import { openAuthWindow } from "@/utils/authWindow";
@@ -136,9 +137,15 @@ export function CloudProvider({ children }: { children: ReactNode }) {
     [isConnected],
   );
 
-  const apiUrl = getApiOrigin();
-  const cloudDashboardUrl = getCloudDashboardUrl(cloudAuthUrl);
-  const connectUrl = `${cloudDashboardUrl}/login?callback=${encodeURIComponent(`${apiUrl}/api/cloud/connect-callback`)}`;
+  // Go straight to the SaaS API's handoff endpoint. The handoff itself
+  // bounces to /login when the user isn't authenticated there, so this
+  // entry point handles BOTH "already signed in" (mint code immediately)
+  // and "needs login first" (login page is configured to forward to
+  // handoff post-auth via getPostAuthRedirect). Hitting /login first
+  // would let (auth)/layout.tsx silently drop the callback param when
+  // the SaaS already has a session.
+  const callbackUrl = `${getApiOrigin(typeof window !== "undefined" ? window.location.origin : undefined)}/api/cloud/connect-callback`;
+  const connectUrl = getCloudConnectHandoffUrl(callbackUrl);
 
   /** Desktop IPC connect flow with PKCE + nonce polling */
   const startDesktopConnect = useCallback(async () => {

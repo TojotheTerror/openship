@@ -13,6 +13,7 @@
 
 import { Hono } from "hono";
 import { env } from "../../config/env";
+import { auth } from "../../lib/auth";
 import { internalAuth } from "../../middleware/internal-auth";
 import * as ctrl from "./auth.controller";
 
@@ -28,4 +29,4 @@ if (env.DEPLOY_MODE === "desktop") {
 }
 
 // Better Auth catch-all — must be last so the desktop overrides win.
-authRoutes.on(["GET", "POST"], "/*", ctrl.betterAuthHandler);
+authRoutes.on(["GET", "POST"], "/*", (c) => auth.handler(c.req.raw));

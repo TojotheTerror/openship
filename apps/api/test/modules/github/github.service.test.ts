@@ -18,7 +18,7 @@ vi.mock("../../../src/modules/github/github.local-auth", () => ({
 
 vi.mock("../../../src/config/env", () => ({
   env: {},
-  runtimeTarget: { id: "docker" },
+  runtimeTarget: { id: "local" },
 }));
 
 import { listRepositoryTree } from "../../../src/modules/github/github.service";

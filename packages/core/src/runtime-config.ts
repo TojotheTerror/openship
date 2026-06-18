@@ -6,99 +6,86 @@ export const DEFAULT_PORT = {
   saasApi: 4100,
 } as const;
 
-function localhost(port: number) {
-  return `http://localhost:${port}`;
-}
+const localhost = (port: number) => `http://localhost:${port}`;
 
+// Standalone URL exports — consumed by desktop, CLI, and onboarding
+// flows that want "the localhost dashboard URL" without going through
+// the runtime-target table. They're the same strings used inside
+// DASHBOARD_RUNTIME_TARGETS below; single source for each value.
 export const LOCAL_WEB_URL = localhost(DEFAULT_PORT.web);
 export const LOCAL_DASHBOARD_URL = localhost(DEFAULT_PORT.dashboard);
 export const LOCAL_API_URL = localhost(DEFAULT_PORT.api);
-export const LOCAL_SAAS_DASHBOARD_URL = localhost(DEFAULT_PORT.saasDashboard);
-export const LOCAL_SAAS_API_URL = localhost(DEFAULT_PORT.saasApi);
 export const CLOUD_DASHBOARD_URL = "https://app.openship.io";
 export const CLOUD_API_URL = "https://api.openship.io";
 
-export const DASHBOARD_RUNTIME_TARGET_IDS = ["local", "local-saas", "cloud-saas"] as const;
-
-export type DashboardRuntimeTargetId = (typeof DASHBOARD_RUNTIME_TARGET_IDS)[number];
-
-export const CLOUD_RUNTIME_TARGET_ID = "cloud-saas" satisfies DashboardRuntimeTargetId;
-export const CURRENT_SELF_HOSTED_RUNTIME_TARGET_ID = "local" satisfies DashboardRuntimeTargetId;
-// Change this to "cloud-saas" when SaaS mode should use app/api.openship.io.
-export const CURRENT_SAAS_RUNTIME_TARGET_ID = "cloud-saas" satisfies DashboardRuntimeTargetId;
-
-export type DashboardRuntimeTarget = {
-  id: DashboardRuntimeTargetId;
-  dashboard: string;
-  api: string;
-  ports: {
-    dashboard: number;
-    api: number;
-  };
-  cloudTargetId: DashboardRuntimeTargetId;
-  selfHosted: boolean;
-  deployMode: "docker" | "cloud";
-  authMode: "local";
-};
-
-export const DASHBOARD_RUNTIME_TARGETS = [
-  {
-    id: "local",
+/**
+ * THE runtime-target table. Keyed by id — the id IS the key, no
+ * redundant `id` field on the row. To enable a runtime target,
+ * uncomment its entry. OPENSHIP_TARGET picks one row.
+ *
+ *   OPENSHIP_TARGET=local        (default — self-hosted; talks to cloud-saas)
+ *   OPENSHIP_TARGET=cloud-saas   (the SaaS — api.openship.io in prod, or a
+ *                                tunneled localhost during dev:saas)
+ *   OPENSHIP_TARGET=local-saas   (DISABLED — uncomment the row to enable a
+ *                                localhost-only SaaS for dev without
+ *                                tunneling api.openship.io)
+ *
+ * No NODE_ENV magic, no CLOUD_MODE-based inference. Invalid value
+ * throws — fail-loud beats silently picking the wrong URL.
+ */
+export const DASHBOARD_RUNTIME_TARGETS = {
+  local: {
     dashboard: LOCAL_DASHBOARD_URL,
     api: LOCAL_API_URL,
-    ports: {
-      dashboard: DEFAULT_PORT.dashboard,
-      api: DEFAULT_PORT.api,
-    },
-    cloudTargetId: CLOUD_RUNTIME_TARGET_ID,
+    ports: { dashboard: DEFAULT_PORT.dashboard, api: DEFAULT_PORT.api },
+    cloudTargetId: "cloud-saas",
     selfHosted: true,
     deployMode: "docker",
     authMode: "local",
   },
-  {
-    id: "local-saas",
-    dashboard: LOCAL_SAAS_DASHBOARD_URL,
-    api: LOCAL_SAAS_API_URL,
-    ports: {
-      dashboard: DEFAULT_PORT.saasDashboard,
-      api: DEFAULT_PORT.saasApi,
-    },
-    cloudTargetId: "local-saas",
-    selfHosted: false,
-    deployMode: "cloud",
-    authMode: "local",
-  },
-  {
-    id: "cloud-saas",
+  // "local-saas": {
+  //   dashboard: localhost(DEFAULT_PORT.saasDashboard),
+  //   api: localhost(DEFAULT_PORT.saasApi),
+  //   ports: { dashboard: DEFAULT_PORT.saasDashboard, api: DEFAULT_PORT.saasApi },
+  //   // Self-referential — dev:saas IS the SaaS when this row is active,
+  //   // so cloud calls land back on itself at localhost:4100 instead of
+  //   // round-tripping to api.openship.io.
+  //   cloudTargetId: "local-saas",
+  //   selfHosted: false,
+  //   deployMode: "cloud",
+  //   authMode: "local",
+  // },
+  "cloud-saas": {
     dashboard: CLOUD_DASHBOARD_URL,
     api: CLOUD_API_URL,
-    ports: {
-      dashboard: DEFAULT_PORT.saasDashboard,
-      api: DEFAULT_PORT.saasApi,
-    },
-    cloudTargetId: CLOUD_RUNTIME_TARGET_ID,
+    ports: { dashboard: DEFAULT_PORT.saasDashboard, api: DEFAULT_PORT.saasApi },
+    cloudTargetId: "cloud-saas",
     selfHosted: false,
     deployMode: "cloud",
     authMode: "local",
   },
-] as const satisfies readonly DashboardRuntimeTarget[];
+} as const;
 
-export function getDashboardRuntimeTarget(id: DashboardRuntimeTargetId) {
-  const target = DASHBOARD_RUNTIME_TARGETS.find((candidate) => candidate.id === id);
-  if (!target) {
-    throw new Error(`Unknown Openship dashboard runtime target: ${id}`);
-  }
-  return target;
+export type DashboardRuntimeTargetId = keyof typeof DASHBOARD_RUNTIME_TARGETS;
+export type DashboardRuntimeTarget = (typeof DASHBOARD_RUNTIME_TARGETS)[DashboardRuntimeTargetId];
+
+// SINGLE knob, resolved ONCE at module load. process.env.OPENSHIP_TARGET
+// picks the row. Invalid value throws fail-loud.
+const rawTarget =
+  (typeof process !== "undefined" ? process.env?.OPENSHIP_TARGET : undefined) ?? "local";
+if (!(rawTarget in DASHBOARD_RUNTIME_TARGETS)) {
+  throw new Error(
+    `OPENSHIP_TARGET="${rawTarget}" is not a valid runtime target. ` +
+      `Use one of: ${Object.keys(DASHBOARD_RUNTIME_TARGETS).join(", ")}.`,
+  );
 }
 
-export function inferDashboardRuntimeTargetId(input: { cloudMode?: boolean } = {}): DashboardRuntimeTargetId {
-  return input.cloudMode ? CURRENT_SAAS_RUNTIME_TARGET_ID : CURRENT_SELF_HOSTED_RUNTIME_TARGET_ID;
-}
+export const runtimeTargetId = rawTarget as DashboardRuntimeTargetId;
+export const runtimeTarget = DASHBOARD_RUNTIME_TARGETS[runtimeTargetId];
+export const cloudRuntimeTargetId = runtimeTarget.cloudTargetId;
+export const cloudRuntimeTarget = DASHBOARD_RUNTIME_TARGETS[cloudRuntimeTargetId];
 
-export function resolveDashboardRuntimeTarget(input: { cloudMode?: boolean } = {}) {
-  return getDashboardRuntimeTarget(inferDashboardRuntimeTargetId(input));
-}
-
-export function getDashboardRuntimeOrigins() {
-  return DASHBOARD_RUNTIME_TARGETS.flatMap(({ dashboard, api }) => [dashboard, api]);
-}
+// Every dashboard + api origin from the table — used for CORS allowlists.
+export const dashboardRuntimeOrigins = Object.values(DASHBOARD_RUNTIME_TARGETS).flatMap(
+  ({ dashboard, api }) => [dashboard, api],
+);

@@ -23,6 +23,7 @@
 
 import cronParser from "cron-parser";
 import { repos } from "@repo/db";
+import { safeErrorMessage } from "@repo/core";
 import type { JobRunner } from "./types";
 
 const POLL_INTERVAL_MS = 30_000;
@@ -154,7 +155,7 @@ export class InProcessJobRunner implements JobRunner {
       } catch (err) {
         console.warn(
           `[job-runner:in-process] recurring ${entry.jobId} failed:`,
-          err instanceof Error ? err.message : err,
+          safeErrorMessage(err),
         );
       }
       // Arm the next tick.
@@ -177,7 +178,7 @@ export class InProcessJobRunner implements JobRunner {
         .catch((err) =>
           console.error(
             `[job-runner:in-process] run ${runId} crashed:`,
-            err instanceof Error ? err.message : err,
+            safeErrorMessage(err),
           ),
         )
         .finally(() => {
@@ -206,7 +207,7 @@ export class InProcessJobRunner implements JobRunner {
     } catch (err) {
       console.warn(
         "[job-runner:in-process] poll query failed:",
-        err instanceof Error ? err.message : err,
+        safeErrorMessage(err),
       );
     }
   }
@@ -225,7 +226,7 @@ export class InProcessJobRunner implements JobRunner {
     } catch (err) {
       console.warn(
         "[job-runner:in-process] boot requeue failed:",
-        err instanceof Error ? err.message : err,
+        safeErrorMessage(err),
       );
     }
   }

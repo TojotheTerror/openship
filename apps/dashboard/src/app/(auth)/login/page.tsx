@@ -96,7 +96,7 @@ function LoginPageInner() {
 
   /* ── Zero-auth mode (desktop): auto-redirect to create session ── */
   if (authMode === "none") {
-    const apiUrl = getApiOrigin();
+    const apiUrl = getApiOrigin(typeof window !== "undefined" ? window.location.origin : undefined);
     // Redirect to the desktop-login endpoint which creates a real
     // session cookie and redirects back to the dashboard.
     if (typeof window !== "undefined") {
@@ -113,7 +113,7 @@ function LoginPageInner() {
 
   /* ── Cloud mode (desktop): redirect to Openship Cloud for all auth ── */
   if (authMode === "cloud") {
-    const apiUrl = getApiOrigin();
+    const apiUrl = getApiOrigin(typeof window !== "undefined" ? window.location.origin : undefined);
     const callbackUrl = `${apiUrl}/api/auth/cloud-callback`;
     const cloudLoginUrl = buildDesktopAuthorizeUrl({ cloudAuthUrl, callbackUrl });
 

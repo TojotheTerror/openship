@@ -1,6 +1,6 @@
 import "server-only";
 import { cookies, headers } from "next/headers";
-import { getApiOriginFromHeaders } from "@/lib/api/urls";
+import { getApiOrigin, getRequestOriginFromHeaders } from "@/lib/api/urls";
 
 /**
  * Server-side API client for Next.js server components, layouts, and route handlers.
@@ -100,7 +100,7 @@ async function request<T = unknown>(
 ): Promise<T> {
   const { body, timeout = DEFAULT_TIMEOUT, params, headers: extraHeaders, cache, revalidate } = opts;
   const requestHeaders = await headers();
-  const baseUrl = getApiOriginFromHeaders(requestHeaders);
+  const baseUrl = getApiOrigin(getRequestOriginFromHeaders(requestHeaders));
 
   /* --- Build URL -------------------------------------------------- */
   const url = new URL(path.startsWith("/") ? path : `/${path}`, baseUrl);

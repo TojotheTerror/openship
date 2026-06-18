@@ -1,4 +1,4 @@
-import type { Context, Next } from "hono";
+import type { Context } from "hono";
 import { ZodError } from "zod";
 import { AppError } from "@repo/core";
 
@@ -10,18 +10,12 @@ import { AppError } from "@repo/core";
  * 2. AppError subclass → statusCode + message + code
  * 3. Unknown → 500
  *
- * Used by both:
- *   - `app.onError(handleApiError)` — the PRIMARY path. Hono's compose()
- *     wraps each dispatch level in try/catch and routes thrown errors to
- *     `this.errorHandler` (Hono instance, set via `app.onError`). A throw
- *     from a route handler is caught at the route's own dispatch level —
- *     it never propagates up to a parent middleware's `await next()`. So
- *     a try/catch-around-next middleware can NEVER catch thrown errors
- *     from downstream; only an `app.onError` registration sees them.
- *   - `errorHandler` middleware below — kept as a no-op safety net for
- *     errors thrown OUTSIDE the dispatch chain (e.g., synchronous code
- *     that runs before compose, or in middleware that does NOT await
- *     next()). Real coverage comes from `app.onError(handleApiError)`.
+ * Registered via `app.onError(handleApiError)`. Hono's compose() wraps
+ * each dispatch level in try/catch and routes thrown errors to
+ * `this.errorHandler` (Hono instance, set via `app.onError`). A throw
+ * from a route handler is caught at the route's own dispatch level — it
+ * never propagates up to a parent middleware's `await next()`, so a
+ * try/catch-around-next middleware would never see downstream throws.
  */
 export function handleApiError(err: unknown, c: Context) {
   if (err instanceof ZodError) {
@@ -45,17 +39,4 @@ export function handleApiError(err: unknown, c: Context) {
 
   console.error("[UNHANDLED ERROR]", err);
   return c.json({ error: "Internal server error" }, 500);
-}
-
-/**
- * try/catch-around-next middleware. DOES NOT catch downstream thrown
- * errors — see the note on `handleApiError`. The real handler is
- * `app.onError(handleApiError)` in app.ts.
- */
-export async function errorHandler(c: Context, next: Next) {
-  try {
-    await next();
-  } catch (err: unknown) {
-    return handleApiError(err, c);
-  }
 }

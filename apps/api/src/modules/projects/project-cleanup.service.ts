@@ -13,7 +13,7 @@
 
 import { repos, type Project, type Deployment } from "@repo/db";
 import { DockerRuntime, type RuntimeAdapter } from "@repo/adapters";
-import { NotFoundError } from "@repo/core";
+import { NotFoundError, safeErrorMessage } from "@repo/core";
 import { assertResourceInOrg, platform } from "../../lib/controller-helpers";
 import { resolveDeploymentRuntime } from "../../lib/deployment-runtime";
 import { buildServiceRouteDomain } from "../../lib/routing-domains";
@@ -405,9 +405,11 @@ export async function executeCleanup(
       } else {
         const resource = batch[j];
         const reason = settled[j] as PromiseRejectedResult;
-        const errMsg =
-          reason.reason instanceof Error ? reason.reason.message : String(reason.reason);
-        result.failed.push({ ref: resource.ref, label: resource.label, error: errMsg });
+        result.failed.push({
+          ref: resource.ref,
+          label: resource.label,
+          error: safeErrorMessage(reason.reason),
+        });
       }
     }
   }

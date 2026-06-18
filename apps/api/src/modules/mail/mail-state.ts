@@ -20,6 +20,7 @@
 const MAX_PERSISTED_LOGS = 800;
 
 import type { CommandExecutor } from "@repo/adapters";
+import { safeErrorMessage } from "@repo/core";
 
 /**
  * Where the state file lives on the target server. `/root/` matches
@@ -257,7 +258,7 @@ export async function readState(
     return parsed;
   } catch (err) {
     console.warn(
-      `mail-state: failed to parse ${STATE_FILE_PATH}: ${err instanceof Error ? err.message : err}`,
+      `mail-state: failed to parse ${STATE_FILE_PATH}: ${safeErrorMessage(err)}`,
     );
     return null;
   }

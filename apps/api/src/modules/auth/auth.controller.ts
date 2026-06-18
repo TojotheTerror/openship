@@ -313,11 +313,3 @@ export async function desktopClaim(c: Context) {
   await setSessionCookie(c, result.token, result.expiresAt);
   return c.redirect(runtimeTarget.dashboard);
 }
-
-/**
- * Better Auth catch-all. All standard auth endpoints (sign-in/up,
- * organization plugin endpoints, OAuth callbacks) go through here.
- */
-export function betterAuthHandler(c: Context) {
-  return auth.handler(c.req.raw);
-}

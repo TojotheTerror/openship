@@ -17,6 +17,7 @@ import { Oblien } from "@repo/adapters";
 import { env } from "../../config/env";
 import { getOblienClient } from "../../lib/openship-cloud";
 import { getOrgCloudToken } from "../../lib/cloud-client";
+import { cacheStore } from "../../lib/cache-store";
 
 export interface ImageCatalogEntry {
   /** Unique slug, e.g. "postgres" - what the user picks in the catalog */
@@ -46,13 +47,7 @@ interface CatalogParams {
   category?: string;
 }
 
-interface CacheEntry {
-  expiresAt: number;
-  images: ImageCatalogEntry[];
-}
-
-const CACHE_TTL_MS = 5 * 60 * 1000;
-const cache = new Map<string, CacheEntry>();
+const CACHE_TTL_S = 5 * 60;
 
 function cacheKey(userId: string | "saas", params: CatalogParams): string {
   return `${userId}::${params.search ?? ""}::${params.category ?? ""}`;
@@ -90,16 +85,14 @@ export async function listImages(
   organizationId: string,
   params: CatalogParams = {},
 ): Promise<ImageCatalogEntry[]> {
+  const store = await cacheStore<ImageCatalogEntry[]>("oblien-image-catalog");
   const key = cacheKey(env.CLOUD_MODE ? "saas" : organizationId, params);
-  const hit = cache.get(key);
-  if (hit && hit.expiresAt > Date.now()) {
-    return hit.images;
-  }
+  const hit = await store.get(key);
+  if (hit) return hit;
 
   const client = await getClientForOrg(organizationId);
   const response = await client.workspaces.images.list(params);
   const images = normalizeImages(response);
-
-  cache.set(key, { expiresAt: Date.now() + CACHE_TTL_MS, images });
+  await store.set(key, images, CACHE_TTL_S);
   return images;
 }

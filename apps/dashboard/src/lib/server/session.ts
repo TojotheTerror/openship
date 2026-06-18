@@ -85,10 +85,11 @@ let _deploymentInfoFetchedAt = 0;
 
 /**
  * Deployment info is mostly static, but during desktop onboarding
- * authMode can change from "none" to "cloud" or vice versa.
- * Re-fetch every 30 seconds so changes take effect quickly.
+ * authMode can flip and during dev the API can restart with a
+ * different cloud target. Short TTL in dev so a stale value never
+ * latches for long; 30s in prod where the values truly are static.
  */
-const DEPLOYMENT_INFO_TTL = 30_000;
+const DEPLOYMENT_INFO_TTL = process.env.NODE_ENV === "production" ? 30_000 : 2_000;
 
 export async function getDeploymentInfo(): Promise<DeploymentInfo> {
   if (_deploymentInfo && Date.now() - _deploymentInfoFetchedAt < DEPLOYMENT_INFO_TTL) {

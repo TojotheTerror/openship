@@ -30,7 +30,7 @@
  */
 
 import type { Context } from "hono";
-import { ForbiddenError, NotFoundError } from "@repo/core";
+import { NotFoundError } from "@repo/core";
 import { repos } from "@repo/db";
 import type { Permission, ResourceType } from "@repo/db";
 import { getUserId } from "./controller-helpers";
@@ -227,10 +227,18 @@ export function resolveRequestScopeOrg(c: Context): string | null {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Pure role check (no context required)                              */
+/*  Public API                                                         */
 /* ------------------------------------------------------------------ */
 
-async function roleCheck(
+/**
+ * Pure resolver — userId + orgId in, boolean out. Used in places where
+ * a Hono context isn't available (background jobs, hooks).
+ *
+ * For resource-detail input, the CALLER is responsible for already having
+ * verified that organizationId matches the resource's org. Prefer `assert()`
+ * with a context — it does the verification for you.
+ */
+export async function checkPermission(
   userId: string,
   organizationId: string,
   input: PermissionInput,
@@ -294,90 +302,46 @@ async function roleCheck(
   return false;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Public API                                                         */
-/* ------------------------------------------------------------------ */
-
 /**
- * Pure resolver — userId + orgId in, boolean out. Used in places where
- * a Hono context isn't available (background jobs, hooks).
+ * Assert version — throws 404 on deny so out-of-permission resources
+ * don't leak existence via 403s. The IDOR-safe pattern.
  *
- * For resource-detail input, the CALLER is responsible for already having
- * verified that organizationId matches the resource's org. Prefer `check()`
- * with a context — it does the verification for you.
- */
-export async function checkPermission(
-  userId: string,
-  organizationId: string,
-  input: PermissionInput,
-): Promise<boolean> {
-  return roleCheck(userId, organizationId, input);
-}
-
-/**
- * Hono-context check. Derives org from the resource (detail endpoints) or
- * the request scope (list/create endpoints), then runs the role check.
+ * Derives org from the resource (detail endpoints) or the request scope
+ * (list/create endpoints), then runs the role check.
  *
  * SIDE EFFECT: on success, stashes the resolved org id under
  * `c.set("scopedOrganizationId", orgId)` so downstream controllers can read
  * "which org am I operating in" without re-deriving.
  */
-export async function check(c: Context, input: PermissionInput): Promise<boolean> {
+export async function assert(c: Context, input: PermissionInput): Promise<void> {
   const userId = getUserId(c);
 
-  let organizationId: string;
+  let organizationId: string | null;
 
-  if (input.scope === "list") {
-    const resolved = resolveRequestScopeOrg(c);
-    if (!resolved) return false;
-    organizationId = resolved;
-  } else if (input.resourceId === "*") {
-    // Org-singleton (billing/audit) — org from request scope.
-    const resolved = resolveRequestScopeOrg(c);
-    if (!resolved) return false;
-    organizationId = resolved;
+  if (input.scope === "list" || input.resourceId === "*") {
+    // List scope, or org-singleton (billing/audit) — org from request scope.
+    organizationId = resolveRequestScopeOrg(c);
   } else {
     const resource = await resolveResourceOrg(input.resourceType, input.resourceId);
-    if (!resource) return false;
-    organizationId = resource.orgId;
+    organizationId = resource?.orgId ?? null;
   }
 
-  const allowed = await roleCheck(userId, organizationId, input);
-  if (allowed) {
-    c.set("scopedOrganizationId", organizationId);
+  if (!organizationId) {
+    throw new NotFoundError(input.resourceType, input.resourceId);
   }
-  return allowed;
-}
 
-/**
- * Assert version — throws 404 on deny so out-of-permission resources
- * don't leak existence via 403s. The IDOR-safe pattern.
- */
-export async function assert(c: Context, input: PermissionInput): Promise<void> {
-  const allowed = await check(c, input);
+  const allowed = await checkPermission(userId, organizationId, input);
   if (!allowed) {
     throw new NotFoundError(input.resourceType, input.resourceId);
   }
-}
 
-/**
- * Like `assert` but throws 403 instead of 404. Use ONLY when the caller
- * already knows the resource exists (e.g. they just listed it) but lacks
- * the specific action permission. Default to `assert` for safety.
- */
-export async function require_(c: Context, input: PermissionInput): Promise<void> {
-  const allowed = await check(c, input);
-  if (!allowed) {
-    throw new ForbiddenError(
-      `Insufficient permissions for ${input.action} on ${input.resourceType}`,
-    );
-  }
+  c.set("scopedOrganizationId", organizationId);
 }
 
 /**
  * Helper exported for controllers that need the resolved org id directly
  * (e.g. to stamp it on a new resource at create time). Reads what
- * `check()` stashed; falls back to deriving from the request scope.
+ * `assert()` stashed; falls back to deriving from the request scope.
  */
 export function getScopedOrgId(c: Context): string {
   const stashed = c.get("scopedOrganizationId");
@@ -392,10 +356,8 @@ export function getScopedOrgId(c: Context): string {
 }
 
 export const permission = {
-  check,
   checkPermission,
   assert,
-  require: require_,
   resolveRequestScopeOrg,
   getScopedOrgId,
 };

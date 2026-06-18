@@ -1,7 +1,7 @@
 /**
  * Local billing controller - runs only when !CLOUD_MODE.
  *
- * Proxies billing operations to the SaaS API via cloudBillingFetch,
+ * Proxies billing operations to the SaaS API via cloudFetch,
  * following the same pattern as cloud-local.controller.ts.
  *
  * The user's cloud session is server-side only (encrypted in DB).
@@ -23,8 +23,8 @@ async function proxyToCloud(
   const userId = getUserId(c);
   const body = method !== "GET" ? await c.req.text() : undefined;
 
-  const { cloudBillingFetch } = await import("../../lib/cloud-client");
-  const res = await cloudBillingFetch(userId, path, { method, body });
+  const { cloudFetch } = await import("../../lib/cloud-client");
+  const res = await cloudFetch(userId, `/api/billing${path}`, { method, body });
 
   if (!res) {
     return c.json({ error: "Not connected to Openship Cloud" }, 403);

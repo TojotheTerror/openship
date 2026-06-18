@@ -2,7 +2,7 @@
  * Local billing proxy — runs only when !CLOUD_MODE.
  *
  * Proxies subscription/payment/invoice operations to the SaaS API
- * using the user's stored cloud session token (via cloudBillingFetch).
+ * using the user's stored cloud session token (via cloudFetch).
  *
  * Plan listing (GET /plans) is handled by billingPlansRoutes which
  * runs on ALL instances — no proxy needed for that.

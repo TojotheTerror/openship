@@ -20,7 +20,7 @@ import { repos } from "@repo/db";
 import { APIError } from "better-auth/api";
 import { env } from "../../config/env";
 import { auth } from "../../lib/auth";
-import { createCacheStore, type CacheStore } from "../../lib/cache-store";
+import { cacheStore } from "../../lib/cache-store";
 import { getLocalGhStatus, getLocalGhToken } from "./github.local-auth";
 import type {
   GitHubConnectionState,
@@ -43,23 +43,19 @@ const GITHUB_TOKEN_CACHE_TTL_SECONDS = 45 * 60;
 
 /**
  * Cache key shapes — all owned by this module. The shape matters for
- * invalidation: anything prefixed with `inst:user:${userId}:` or
- * `instToken:${userId}:` belongs to a single user; anything with
- * `inst:org:${organizationId}:` or `instToken:cloud:${organizationId}:`
- * belongs to a whole org and is shared between every member.
+ * invalidation:
+ *   - `inst:user:${userId}:`             — per-user installation-ID lookup
+ *   - `instToken:local:user:${userId}:`  — per-user local-mint fallback
+ *                                          (only when no org context)
+ *   - `inst:org:${organizationId}:`      — org-shared installation-ID lookup
+ *   - `instToken:local:org:${organizationId}:` — org-shared local-mint
+ *   - `instToken:cloud:${organizationId}:`     — org-shared cloud-proxied mint
  *
  * Prefix-based invalidation (below) is the ONLY safe way to clear keys
  * containing a userId — substring matching would clobber unrelated
  * org keys whose IDs happen to share characters with the userId.
  */
-let _tokenStore: Promise<CacheStore<string>> | null = null;
-
-function getTokenStore(): Promise<CacheStore<string>> {
-  if (!_tokenStore) {
-    _tokenStore = createCacheStore<string>("gh-tokens", { maxSize: 5_000 });
-  }
-  return _tokenStore;
-}
+const GH_TOKEN_NS = "gh-tokens";
 
 /**
  * Clear every cached entry that belongs to this user — both the
@@ -74,9 +70,9 @@ function getTokenStore(): Promise<CacheStore<string>> {
  * cached installations.
  */
 export async function invalidateUserGitHubCache(userId: string): Promise<void> {
-  const store = await getTokenStore();
+  const store = await cacheStore<string>(GH_TOKEN_NS, { maxSize: 5_000 });
   await store.invalidateByPrefix(`inst:user:${userId}:`);
-  await store.invalidateByPrefix(`instToken:${userId}:`);
+  await store.invalidateByPrefix(`instToken:local:user:${userId}:`);
 }
 
 /**
@@ -86,38 +82,25 @@ export async function invalidateUserGitHubCache(userId: string): Promise<void> {
  * prefix is swept atomically.
  */
 export async function invalidateOrgGitHubCache(organizationId: string): Promise<void> {
-  const store = await getTokenStore();
+  const store = await cacheStore<string>(GH_TOKEN_NS, { maxSize: 5_000 });
   await store.invalidateByPrefix(`inst:org:${organizationId}:`);
+  await store.invalidateByPrefix(`instToken:local:org:${organizationId}:`);
   await store.invalidateByPrefix(`instToken:cloud:${organizationId}:`);
 }
 
 // ─── App-level JWT ───────────────────────────────────────────────────────────
 
-/** Cached decoded PEM - decoded once from base64 on first use. */
-let _cachedPrivateKey: string | null = null;
-
 /**
- * Resolve the GitHub App private key from environment.
+ * Decoded GitHub App private key, resolved once at module load.
  * Supports two formats:
- *   - GITHUB_PRIVATE_KEY       - raw PEM string (multi-line)
+ *   - GITHUB_PRIVATE_KEY        - raw PEM string (multi-line)
  *   - GITHUB_PRIVATE_KEY_BASE64 - base64-encoded PEM (single env var line)
- * Decoded value is cached in memory.
+ * Null when neither is set — `generateAppJwt` throws on use.
  */
-function resolvePrivateKey(): string {
-  if (_cachedPrivateKey) return _cachedPrivateKey;
-
-  if (env.GITHUB_PRIVATE_KEY) {
-    _cachedPrivateKey = env.GITHUB_PRIVATE_KEY;
-    return _cachedPrivateKey;
-  }
-
-  if (env.GITHUB_PRIVATE_KEY_BASE64) {
-    _cachedPrivateKey = Buffer.from(env.GITHUB_PRIVATE_KEY_BASE64, "base64").toString("utf-8");
-    return _cachedPrivateKey;
-  }
-
-  throw new Error("GITHUB_PRIVATE_KEY or GITHUB_PRIVATE_KEY_BASE64 is required");
-}
+const PRIVATE_KEY: string | null = env.GITHUB_PRIVATE_KEY
+  ?? (env.GITHUB_PRIVATE_KEY_BASE64
+    ? Buffer.from(env.GITHUB_PRIVATE_KEY_BASE64, "base64").toString("utf-8")
+    : null);
 
 /**
  * Generate a short-lived JWT for authenticating as the GitHub App itself.
@@ -131,7 +114,10 @@ export function generateAppJwt(): string {
     throw new Error("GITHUB_APP_ID is required");
   }
 
-  const privateKey = resolvePrivateKey();
+  if (!PRIVATE_KEY) {
+    throw new Error("GITHUB_PRIVATE_KEY or GITHUB_PRIVATE_KEY_BASE64 is required");
+  }
+
   const now = Math.floor(Date.now() / 1000);
 
   const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
@@ -142,7 +128,7 @@ export function generateAppJwt(): string {
   const signature = crypto
     .createSign("RSA-SHA256")
     .update(`${header}.${payload}`)
-    .sign(privateKey, "base64url");
+    .sign(PRIVATE_KEY, "base64url");
 
   return `${header}.${payload}.${signature}`;
 }
@@ -206,11 +192,11 @@ export async function getInstallationId(
     const memberships = await repos.member.listByUser(userId).catch(() => []);
     const organizationId = memberships[0]?.organizationId ?? `org_${userId}`;
     const cacheKey = `inst:org:${organizationId}:${owner.toLowerCase()}`;
-    const store = await getTokenStore();
+    const store = await cacheStore<string>(GH_TOKEN_NS, { maxSize: 5_000 });
     const cached = await store.get(cacheKey);
     if (cached) return Number(cached);
-    const { cloudGithubInstallations } = await import("../../lib/cloud-client");
-    const list = await cloudGithubInstallations(organizationId).catch(() => null);
+    const { cloudClient } = await import("../../lib/cloud-client");
+    const list = await cloudClient({ organizationId }).github.installations().catch(() => null);
     if (!list) return null;
     const match = list.find(
       (entry) => entry.login.toLowerCase() === owner.toLowerCase(),
@@ -223,7 +209,7 @@ export async function getInstallationId(
   // Self-hosted "app" mode below — cache by user since the local DB
   // installations are per-user rows.
   const cacheKey = `inst:user:${userId}:${owner.toLowerCase()}`;
-  const store = await getTokenStore();
+  const store = await cacheStore<string>(GH_TOKEN_NS, { maxSize: 5_000 });
   const cached = await store.get(cacheKey);
   if (cached) return Number(cached);
 
@@ -251,7 +237,7 @@ export async function getInstallationIdByOrg(
   if (!organizationId || !owner) return null;
 
   const cacheKey = `inst:org:${organizationId}:${owner.toLowerCase()}`;
-  const store = await getTokenStore();
+  const store = await cacheStore<string>(GH_TOKEN_NS, { maxSize: 5_000 });
   const cached = await store.get(cacheKey);
   if (cached) return Number(cached);
 
@@ -267,8 +253,8 @@ export async function getInstallationIdByOrg(
     : ("none" as const);
 
   if (mode === "cloud-app") {
-    const { cloudGithubInstallations } = await import("../../lib/cloud-client");
-    const list = await cloudGithubInstallations(organizationId).catch(() => null);
+    const { cloudClient } = await import("../../lib/cloud-client");
+    const list = await cloudClient({ organizationId }).github.installations().catch(() => null);
     if (!list) return null;
     const match = list.find(
       (entry) => entry.login.toLowerCase() === owner.toLowerCase(),
@@ -323,15 +309,16 @@ export async function getInstallationToken(
       ?? (await repos.member.listByUser(userId).catch(() => []))[0]?.organizationId
       ?? `org_${userId}`;
     const cacheKey = `instToken:cloud:${orgId}:${owner}`;
-    const store = await getTokenStore();
+    const store = await cacheStore<string>(GH_TOKEN_NS, { maxSize: 5_000 });
     const cached = await store.get(cacheKey);
     if (cached) return cached;
 
-    const { cloudGithubInstallationToken } = await import("../../lib/cloud-client");
-    const minted = await cloudGithubInstallationToken(orgId, {
-      installationId,
-      owner,
-    });
+    const { cloudClient } = await import("../../lib/cloud-client");
+    // installationId is intentionally not passed — the SaaS endpoint resolves
+    // the installation from `owner`, and the unified client signature dropped
+    // the parameter.
+    void installationId;
+    const minted = await cloudClient({ organizationId: orgId }).github.installationToken(owner);
     if (!minted?.token) return null;
     await store.set(cacheKey, minted.token, GITHUB_TOKEN_CACHE_TTL_SECONDS);
     return minted.token;
@@ -351,8 +338,17 @@ export async function getInstallationToken(
   }
   if (!installationId) return null;
 
-  const cacheKey = `instToken:${userId}:${owner}:${installationId}`;
-  const store = await getTokenStore();
+  // The installation token from GitHub is keyed purely on the
+  // installationId (an org-wide GitHub resource), so every member of
+  // the same org should share one cache entry. When organizationId is
+  // in scope, key by org so teammates hit the same mint result.
+  // Fall back to userId only when there's no org context (background
+  // jobs, OAuth-callback callers).
+  const cacheScope = organizationId
+    ? `org:${organizationId}`
+    : `user:${userId}`;
+  const cacheKey = `instToken:local:${cacheScope}:${owner}:${installationId}`;
+  const store = await cacheStore<string>(GH_TOKEN_NS, { maxSize: 5_000 });
   const cached = await store.get(cacheKey);
   if (cached) return cached;
 
@@ -504,9 +500,18 @@ export async function getUserStatus(userId: string) {
 
   // ── Cloud-app: status comes from openship.io ────────────────────────────
   if (mode === "cloud-app") {
-    const { cloudGithubUserStatus } = await import("../../lib/cloud-client");
-    const status = await cloudGithubUserStatus(userId);
+    const { cloudClient } = await import("../../lib/cloud-client");
+    const status = await cloudClient({ userId }).github.userStatus();
     if (!status?.connected) {
+      // Diagnostic: the SaaS-side handler reported the user as not
+      // connected. The most likely cause is that the local's
+      // cloudSessionToken now resolves to a different SaaS user than
+      // the one OAuth linked to (session rotated, account re-linked,
+      // 401 cleanup wiped it). Log the local userId so it can be
+      // correlated with the SaaS log line.
+      console.log(
+        `[github.auth:getUserStatus] cloud-app reports disconnected localUserId=${userId} cloudResponse=${JSON.stringify(status ?? null)}`,
+      );
       return { connected: false as const, tokenSource: null };
     }
     return {
@@ -702,10 +707,10 @@ export async function getUserInstallations(
     //
     // Short-term memoization is handled by `tokenCache` in the
     // per-resource lookups (getInstallationId / getInstallationIdByOrg).
-    const { cloudGithubInstallations } = await import("../../lib/cloud-client");
+    const { cloudClient } = await import("../../lib/cloud-client");
     const memberships = await repos.member.listByUser(userId).catch(() => []);
     const organizationId = memberships[0]?.organizationId ?? `org_${userId}`;
-    const list = await cloudGithubInstallations(organizationId);
+    const list = await cloudClient({ organizationId }).github.installations();
     if (!list) return [];
     return list.map((entry) => ({
       id: entry.id,
@@ -899,8 +904,8 @@ export async function resolveInstallUrl(
     // installation belongs to the team, not the clicking member.
     const memberships = await repos.member.listByUser(userId).catch(() => []);
     const organizationId = memberships[0]?.organizationId ?? `org_${userId}`;
-    const { cloudGithubInstallUrl } = await import("../../lib/cloud-client");
-    const res = await cloudGithubInstallUrl(organizationId);
+    const { cloudClient } = await import("../../lib/cloud-client");
+    const res = await cloudClient({ organizationId }).github.installUrl();
     if (res) return res;
     // Cloud unreachable — fall back to the canonical install URL with no
     // state. The exchange will fail later if the user actually installs,
@@ -931,8 +936,8 @@ export async function resolveOauthHandoffUrl(
   const mode = await resolveGitHubAuthMode(userId);
   if (mode !== "cloud-app") return null;
 
-  const { cloudGithubOauthHandoff } = await import("../../lib/cloud-client");
-  return cloudGithubOauthHandoff(userId);
+  const { cloudClient } = await import("../../lib/cloud-client");
+  return cloudClient({ userId }).github.oauthHandoff();
 }
 
 /**

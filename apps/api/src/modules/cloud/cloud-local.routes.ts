@@ -16,3 +16,5 @@ const r = secureRouter(cloudLocalRoutes, {
 r.post("/disconnect", { tag: "cloud:admin" }, requireRole("owner"), local.disconnect);
 r.get("/connect-callback", { tag: "cloud:read" }, requireRole("owner"), local.connectCallback);
 r.get("/status", { tag: "cloud:read" }, local.status);
+
+r.get("/workspaces", { tag: "cloud:read" }, local.listWorkspaces);

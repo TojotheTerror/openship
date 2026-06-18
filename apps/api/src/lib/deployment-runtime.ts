@@ -10,14 +10,23 @@ import type { Deployment } from "@repo/db";
 import { repos } from "@repo/db";
 import type { DeployTarget, RuntimeMode } from "@repo/core";
 import { env } from "../config";
-import { cloudPagesProxy, getOrgCloudToken } from "./cloud-client";
+import { cloudClient, getOrgCloudToken } from "./cloud-client";
 import { platform } from "./controller-helpers";
 import { buildSshConfig, sshManager } from "./ssh-manager";
 
-interface DeploymentMeta {
+/**
+ * The shape of `deployment.meta` JSONB. Snapshotted per-deploy —
+ * historical for any given deployment row, not a live binding.
+ * Persistent bindings live on the project row (e.g.
+ * `project.cloud_workspace_id`); meta is the source for one-time
+ * info the build pipeline needs to remember.
+ */
+export interface DeploymentMeta {
   deployTarget?: DeployTarget;
   runtimeMode?: RuntimeMode;
   serverId?: string;
+  /** Cloud workspace this deployment provisioned (cloud target only). */
+  workspaceId?: string;
 }
 
 export interface ResolvedDeploymentPlatform {
@@ -27,10 +36,6 @@ export interface ResolvedDeploymentPlatform {
   usesManagedRouting: boolean;
   /** The server ID used for SSH targets (null for local/cloud). */
   serverId: string | null;
-}
-
-function localDockerTransport(): DockerConnectionOptions {
-  return { transport: "socket" };
 }
 
 async function resolveServerTargetId(serverId?: string): Promise<string> {
@@ -89,7 +94,7 @@ async function resolveCloudPlatformForOrg(organizationId?: string): Promise<Plat
     target: "cloud",
     cloudToken: result.token,
     cloudAdminProxy: {
-      createPage: (input) => cloudPagesProxy(organizationId, input),
+      createPage: (input) => cloudClient({ organizationId }).pages.create(input),
     },
   });
 }
@@ -183,7 +188,7 @@ export async function resolveTargetPlatform(
     target: "selfhosted",
     runtime: runtimeMode,
     docker: runtimeMode === "docker"
-      ? localDockerTransport()
+      ? { transport: "socket" as const }
       : undefined,
   });
 }

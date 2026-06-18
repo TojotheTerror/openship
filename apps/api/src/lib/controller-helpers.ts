@@ -6,14 +6,16 @@
 
 import type { Context } from "hono";
 import {
-  initPlatform,
-  getPlatform,
-  type Platform,
   type PlatformTarget,
   type PlatformConfig,
 } from "@repo/adapters";
 import { env } from "../config/env";
 import { isOblienConfigured } from "./platform-mode";
+
+// Re-export the platform accessor so existing callers that do
+// `import { platform } from "@/lib/controller-helpers"` keep working
+// without changing every site.
+export { getPlatform as platform } from "@repo/adapters";
 
 // ─── Auth helpers ────────────────────────────────────────────────────────────
 
@@ -25,9 +27,9 @@ export function getUserId(c: Context): string {
 }
 
 /**
- * Extract the active organization ID from Hono context.
- * Set by activeOrganizationMiddleware — every authed route should mount
- * that middleware after authMiddleware.
+ * Extract the active organization ID from Hono context. Set by
+ * `authMiddleware` via `resolveActiveOrganizationId` — every authed
+ * route has this populated.
  */
 export function getActiveOrganizationId(c: Context): string {
   const orgId = c.get("activeOrganizationId");
@@ -37,49 +39,14 @@ export function getActiveOrganizationId(c: Context): string {
   return orgId;
 }
 
-/** Combined getter — both userId (actor) and activeOrgId (scoping). */
-export function getActorContext(c: Context): { userId: string; organizationId: string } {
-  return {
-    userId: getUserId(c),
-    organizationId: getActiveOrganizationId(c),
-  };
-}
-
 /**
- * Assert a resource belongs to the caller's active organization. Throws a
- * 404-shaped error if it doesn't, to avoid leaking the resource's existence
- * across orgs (404, not 403 — IDOR-safe).
- *
- * Use on every per-resource detail/update/delete endpoint:
- *   const project = await repos.project.findById(id);
- *   assertResourceInOrg(project, "Project", organizationId);
- *
- * Resources with `organizationId === null` are rejected (fail-closed).
- * Use `requireResourceInOrg` for an explicit strict variant.
+ * Assert a resource belongs to the caller's active organization. Throws
+ * a 404-shaped error if it doesn't, to avoid leaking existence across
+ * orgs (404, not 403 — IDOR-safe). NULL `organizationId` fails closed.
  */
 import { NotFoundError } from "@repo/core";
 
 export function assertResourceInOrg<T extends { organizationId?: string | null }>(
-  resource: T | null | undefined,
-  resourceLabel: string,
-  organizationId: string,
-  resourceId?: string,
-): asserts resource is T {
-  if (!resource) {
-    throw new NotFoundError(resourceLabel, resourceId);
-  }
-  // 404-shape rather than 403 — never confirm existence of out-of-org
-  // resources. NULL org_id is treated as "not in any org" and fails closed.
-  if (resource.organizationId !== organizationId) {
-    throw new NotFoundError(resourceLabel, resourceId);
-  }
-}
-
-/**
- * Stricter version: rejects resources with NULL organizationId too.
- * Use this in NEW code paths where every resource should be org-stamped.
- */
-export function requireResourceInOrg<T extends { organizationId?: string | null }>(
   resource: T | null | undefined,
   resourceLabel: string,
   organizationId: string,
@@ -111,7 +78,7 @@ export function param(c: Context, name: string): string {
  *   2. DEPLOY_MODE=desktop → "desktop"
  *   3. Default → "selfhosted" with docker or bare runtime
  */
-function resolveConfig(): PlatformConfig {
+export function resolvePlatformConfig(): PlatformConfig {
   if (isOblienConfigured()) {
     return {
       target: "cloud",
@@ -129,31 +96,6 @@ function resolveConfig(): PlatformConfig {
     target: "selfhosted",
     runtime: env.DEPLOY_MODE === "bare" ? "bare" : "docker",
   };
-}
-
-/**
- * Initialize the platform at server startup.
- *
- * Call this ONCE before the server starts handling requests.
- * After this, `platform()` returns the cached instance synchronously.
- */
-export async function bootstrapPlatform(): Promise<Platform> {
-  return initPlatform(resolveConfig());
-}
-
-/**
- * Get the platform - the single entry point for all service code.
- *
- * Returns: { runtime, routing, ssl, system }
- *   - runtime: build/deploy/stop/start lifecycle
- *   - routing: register/remove reverse-proxy routes
- *   - ssl: provision/renew TLS certificates
- *   - system: prerequisite validation (self-hosted only, null otherwise)
- *
- * All service code uses this. Nothing constructs adapters directly.
- */
-export function platform(): Platform {
-  return getPlatform();
 }
 
 // ─── Project access ──────────────────────────────────────────────────────────

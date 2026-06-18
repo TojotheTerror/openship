@@ -33,7 +33,7 @@ import { env, internalApiUrl, runtimeTarget } from "../../config";
 import { resolveProjectTrafficSource, fetchMgmt, mgmtStream } from "../../lib/project-analytics";
 import { refreshProjectFaviconIfStale } from "../../lib/favicon-detector";
 import { getAdminOblienClient } from "../../lib/oblien-user-client";
-import { cloudAnalyticsProxy } from "../../lib/cloud-client";
+import { cloudClient } from "../../lib/cloud-client";
 import {
   registerWebhook,
   updateWebhook,
@@ -164,12 +164,14 @@ export async function getHome(c: Context) {
     });
   }
 
-  // Enrich every project in ONE round trip — five parallel batched
-  // queries instead of (4 × N) per-project queries. With 50 projects
-  // the old loop fired 200+ SQL statements; this version fires ≤6
-  // regardless of project count.
+  // Enrich every project in ONE round trip — batched queries
+  // instead of (4 × N) per-project. With 50 projects the old loop
+  // fired 200+ SQL statements; this version fires a constant ≤6
+  // regardless of project count. The dashboard derives "needs cloud
+  // reconnect" client-side from `deployTarget === 'cloud'` +
+  // CloudContext.connected — no duplicate server-side flag.
   const projectIds = result.rows.map((p) => p.id);
-  const [enrichedProjects, latestByProject, primariesByProject, servicesByProject] =
+  const [enrichedProjectsResolved, latestByProject, primariesByProject, servicesByProject] =
     await Promise.all([
       projectService.enrichProjectsBatch(result.rows),
       repos.deployment.findLatestByProjects(projectIds),
@@ -177,7 +179,7 @@ export async function getHome(c: Context) {
       repos.service.listByProjects(projectIds),
     ]);
 
-  const projects = enrichedProjects.map((enriched, idx) => {
+  const projects = enrichedProjectsResolved.map((enriched, idx) => {
     const original = result.rows[idx];
     const latest = latestByProject.get(original.id);
     const primary = primariesByProject.get(original.id);
@@ -783,7 +785,7 @@ export async function serverLogStreamToken(c: Context) {
         return c.json({ kind: "self-hosted" as const });
       }
     } else {
-      tokenResult = await cloudAnalyticsProxy(organizationId, "streamToken", source.domain);
+      tokenResult = await cloudClient({ organizationId }).analytics.streamToken(source.domain);
     }
 
     const tokenData = extractCloudStreamToken(tokenResult);
@@ -899,7 +901,7 @@ export async function recentServerLogs(c: Context) {
         return c.json({ logs: [] });
       }
     } else {
-      result = await cloudAnalyticsProxy(organizationId, "requests", source.domain, { limit });
+      result = await cloudClient({ organizationId }).analytics.requests(source.domain, { limit });
     }
 
     return c.json({ logs: extractCloudRequestLogs(result) });
@@ -1081,7 +1083,9 @@ export async function linkRepo(c: Context) {
     // User has a verified domain for webhooks → direct delivery
     const webhookUrl = `https://${project.webhookDomain}/_openship/hooks/github`;
     try {
-      const wh = await registerWebhook(userId, owner, repo, webhookUrl);
+      const wh = await registerWebhook(userId, owner, repo, webhookUrl, {
+        organizationId,
+      });
       if (wh.hookId) gitFields.webhookId = wh.hookId;
       gitFields.autoDeploy = true;
     } catch {
@@ -1091,7 +1095,9 @@ export async function linkRepo(c: Context) {
     // Self-hosted with a public URL - create a repo-level push webhook.
     let webhookId: number | null = null;
     try {
-      const result = await registerWebhook(userId, owner, repo);
+      const result = await registerWebhook(userId, owner, repo, undefined, {
+        organizationId,
+      });
       webhookId = result.hookId;
       gitFields.webhookId = webhookId;
       gitFields.autoDeploy = !!webhookId;
@@ -1187,13 +1193,16 @@ async function ensureSharedWebhook(
   const existingHookId =
     project.webhookId ?? (await findSharedWebhookId(project.organizationId, owner, repo));
   const targetWebhookUrl = webhookUrl ?? `${runtimeTarget.api}/api/webhooks/github`;
-  const result = await registerWebhook(userId, owner, repo, targetWebhookUrl);
+  const result = await registerWebhook(userId, owner, repo, targetWebhookUrl, {
+    organizationId: project.organizationId,
+  });
   if (!result.hookId) return null;
 
   if (existingHookId && existingHookId !== result.hookId) {
-    await updateWebhook(userId, owner, repo, existingHookId, { active: false }).catch(
-      () => undefined,
-    );
+    await updateWebhook(userId, owner, repo, existingHookId, {
+      active: false,
+      organizationId: project.organizationId,
+    }).catch(() => undefined);
   }
 
   await syncSharedWebhookId(project.organizationId, owner, repo, result.hookId);
@@ -1213,7 +1222,10 @@ async function disableSharedWebhookIfUnused(
   const projects = repoProjects.filter((p) => p.organizationId === organizationId);
   const hookId = webhookId ?? projects.find((p) => typeof p.webhookId === "number")?.webhookId;
   if (hookId) {
-    await updateWebhook(userId, owner, repo, hookId, { active: false });
+    await updateWebhook(userId, owner, repo, hookId, {
+      active: false,
+      organizationId,
+    });
   }
 }
 

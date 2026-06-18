@@ -14,7 +14,7 @@
 import type { DeploymentConfigSnapshot } from "./build.service";
 import { platform } from "../../lib/controller-helpers";
 import { resolveServiceHostnameLabel } from "@repo/core";
-import { getCloudPreflight } from "../../lib/cloud-client";
+import { cloudClient } from "../../lib/cloud-client";
 import { runCloudPreflight, type CloudPreflightData } from "../../lib/cloud-preflight";
 import type { DeployableService } from "../../lib/deployable-service";
 import { serviceKind } from "./compose/project-services";
@@ -525,7 +525,7 @@ async function requestCloudPreflight(
 
   if (effectiveTarget === "cloud" || plat.target === "desktop") {
     if (!snapshot.organizationId) return null;
-    return getCloudPreflight(snapshot.organizationId, input);
+    return cloudClient({ organizationId: snapshot.organizationId }).preflight(input);
   }
 
   return null;

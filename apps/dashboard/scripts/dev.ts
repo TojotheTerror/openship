@@ -1,7 +1,7 @@
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { resolveDashboardRuntimeTarget } from "@repo/core";
+import { DASHBOARD_RUNTIME_TARGETS } from "@repo/core";
 
 type Mode = "local" | "saas";
 
@@ -9,33 +9,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(__dirname, "..");
 const nextBin = path.join(appRoot, "node_modules", "next", "dist", "bin", "next");
 
-function parseMode(value: string | undefined): Mode {
-  return value === "saas" ? "saas" : "local";
-}
-
-function getRuntimeTarget(mode: Mode) {
-  return resolveDashboardRuntimeTarget({
-    cloudMode: mode === "saas",
-  });
-}
-
 function getConfig(mode: Mode) {
-  const target = getRuntimeTarget(mode);
-
-  if (mode === "saas") {
-    return {
-      port: String(target.ports.dashboard),
-      distDir: ".next-saas",
-    };
-  }
-
+  const target = DASHBOARD_RUNTIME_TARGETS[mode === "saas" ? "cloud-saas" : "local"];
   return {
     port: String(target.ports.dashboard),
-    distDir: ".next",
+    distDir: mode === "saas" ? ".next-saas" : ".next",
   };
 }
 
-const mode = parseMode(process.argv[2]);
+const mode: Mode = process.argv[2] === "saas" ? "saas" : "local";
 const config = getConfig(mode);
 
 const child = spawn("node", [nextBin, "dev", "--port", config.port], {
@@ -43,6 +25,7 @@ const child = spawn("node", [nextBin, "dev", "--port", config.port], {
   stdio: "inherit",
   env: {
     ...process.env,
+    OPENSHIP_TARGET: mode === "saas" ? "cloud-saas" : "local",
     NEXT_DIST_DIR: process.env.NEXT_DIST_DIR ?? config.distDir,
   },
 });

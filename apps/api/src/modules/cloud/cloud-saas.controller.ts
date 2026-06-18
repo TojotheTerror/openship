@@ -1,14 +1,15 @@
 /**
  * Cloud SaaS controller - runs only in CLOUD_MODE.
  *
- * All imports are top-level (no per-request dynamic imports on hot paths).
  * SaaS owns the Oblien master credentials, auth session management, and
- * handoff code generation.
+ * handoff code generation. **All tenant-scoped operations forward via
+ * the caller's namespace token** — Oblien enforces the namespace
+ * boundary natively (no SaaS-side ledger / ownership check needed).
  *
- *   POST /api/cloud/token           - mint namespace-scoped Oblien tokens
- *   POST /api/cloud/analytics       - proxy Oblien analytics (master client)
- *   POST /api/cloud/edge-proxy      - sync Oblien edge proxy for managed domains
- *   POST /api/cloud/pages           - proxy Oblien pages.create (master client)
+ *   POST /api/cloud/token           - mint namespace-scoped Oblien token
+ *   POST /api/cloud/analytics       - proxy Oblien analytics (namespace token)
+ *   POST /api/cloud/edge-proxy      - sync Oblien edge proxy (namespace token)
+ *   POST /api/cloud/pages           - proxy Oblien pages.create (namespace token)
  *   POST /api/cloud/preflight       - cloud deployment preflight check
  *   GET  /api/cloud/desktop-handoff - OAuth → one-time code → redirect to desktop
  *   GET  /api/cloud/connect-handoff - OAuth → one-time code → redirect to self-hosted
@@ -18,40 +19,53 @@
 import type { Context } from "hono";
 import { Oblien } from "@repo/adapters";
 import { SYSTEM, safeErrorMessage } from "@repo/core";
-import { getUserId } from "../../lib/controller-helpers";
+import { getActiveOrganizationId, getUserId } from "../../lib/controller-helpers";
 import { auth, COOKIE_PREFIX } from "../../lib/auth";
-import { issueNamespaceToken, getOblienClient } from "../../lib/openship-cloud";
+import { issueNamespaceToken } from "../../lib/openship-cloud";
 import { generateHandoffCode, exchangeHandoffCode } from "../../lib/cloud-auth-proxy";
 import { runCloudPreflight } from "../../lib/cloud-preflight";
 import { cloudRuntimeTarget, env } from "../../config/env";
-import { repos, db, schema, eq } from "@repo/db";
+import { repos, db, schema, eq, and } from "@repo/db";
 import { createEphemeralStore } from "../../lib/ephemeral-store";
 import * as githubAuth from "../github/github.auth";
 
 /**
- * Resolve the active org's owner — every org-scoped cloud operation
- * (namespace token mint, edge proxy, pages, analytics, GitHub install
- * token) uses the OWNER's identity as the SaaS-side bearer. Team
- * members invoke the SaaS endpoint with their own session; we look up
- * the team's owner and use their namespace/installations so cloud
- * resources are shared across team members within the org.
- *
- * For personal orgs (single-member, isTeam=false) this reduces to the
- * caller themselves — no behavior change for solo SaaS users.
- *
- * Active org resolution: prefer the Better Auth session's
- * activeOrganizationId, fall back to the caller's personal org
- * (always exists via provisionUser).
+ * Mint a namespace-scoped Oblien client for the caller's active org.
+ * The namespace is bound to the org id (not the user id) so team
+ * members all share one namespace and owner rotation never moves it.
+ * Used by analyticsProxy, syncEdgeProxy, pagesProxy.
+ */
+async function getNamespaceClient(organizationId: string): Promise<Oblien> {
+  const { token } = await issueNamespaceToken(organizationId);
+  return new Oblien({ token });
+}
+
+/** Coerce a thrown Oblien SDK error into an HTTP response shape. */
+function oblienErrorResponse(c: Context, err: unknown, fallback: string) {
+  const message = err instanceof Error ? err.message : fallback;
+  const status =
+    typeof err === "object" && err !== null && "status" in err && typeof (err as { status?: unknown }).status === "number"
+      ? (err as { status: number }).status
+      : 500;
+  const code =
+    typeof err === "object" && err !== null && "code" in err
+      ? (err as { code?: unknown }).code
+      : undefined;
+  c.status(status as 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500);
+  return c.json({ error: message, code });
+}
+
+/**
+ * Resolve the active org's owner — used ONLY for GitHub operations
+ * where the App installations are still owner-keyed (the user who
+ * installed the App owns the gitInstallation rows). Cloud namespace
+ * operations skip this: they use `getActiveOrganizationId(c)`
+ * directly and Oblien's namespace = org id.
  */
 async function resolveCloudOwner(
   c: Context,
 ): Promise<{ ownerUserId: string; organizationId: string }> {
-  const callerUserId = getUserId(c);
-  const session = c.get("session") as
-    | { activeOrganizationId?: string | null }
-    | undefined;
-  const organizationId =
-    session?.activeOrganizationId ?? `org_${callerUserId}`;
+  const organizationId = getActiveOrganizationId(c);
   const members = await repos.member.listByOrganization(organizationId);
   const owner = members.find((m) => m.role === "owner");
   if (!owner) {
@@ -62,17 +76,19 @@ async function resolveCloudOwner(
   return { ownerUserId: owner.userId, organizationId };
 }
 
-// ─── Cloud analytics proxy (master client) ───────────────────────────────────
+// ─── Cloud analytics proxy ──────────────────────────────────────────────────
 
 /**
  * POST /api/cloud/analytics  { operation, domain, params }
  *
- * Local/desktop instances call this to get Oblien analytics.
- * Edge proxies + analytics are account-level - namespace tokens can't access them.
- * The SaaS uses the master Oblien client on behalf of the caller.
+ * Local/desktop instances call this to read Oblien analytics for a
+ * hostname they own on Openship Cloud. Forwarded via the caller's
+ * namespace token — Oblien returns data only for hostnames in the
+ * caller's namespace, so cross-tenant access is structurally
+ * impossible. No SaaS-side ownership check needed.
  */
 export async function analyticsProxy(c: Context) {
-  const { ownerUserId, organizationId } = await resolveCloudOwner(c);
+  const organizationId = getActiveOrganizationId(c);
   const { operation, domain, params } = await c.req.json<{
     operation: "timeseries" | "requests" | "streamToken";
     domain: string;
@@ -83,76 +99,35 @@ export async function analyticsProxy(c: Context) {
     return c.json({ error: "operation and domain are required" }, 400);
   }
 
-  // Domain ownership check via the org owner's namespace. Oblien enforces
-  // namespace isolation on edgeProxy.list, so a caller cannot probe
-  // domains outside the org owner's namespace. The master client below
-  // performs the actual analytics read.
   try {
-    const { token } = await issueNamespaceToken(ownerUserId);
-    const scopedClient = new Oblien({ token });
-    const { proxies } = await scopedClient.edgeProxy.list();
-    const requested = domain.toLowerCase();
-    const ownsDomain = proxies.some(
-      (p) =>
-        p.name?.toLowerCase() === requested ||
-        (p.slug && `${p.slug}.${SYSTEM.DOMAINS.CLOUD_DOMAIN}`.toLowerCase() === requested),
-    );
-    if (!ownsDomain) {
-      console.warn(
-        `[CLOUD analytics] org=${organizationId} requested analytics for "${domain}" but it isn't in the org owner's namespace`,
-      );
-      return c.json(
-        { error: `You do not own analytics for ${domain}` },
-        403,
-      );
-    }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "Could not verify domain ownership";
-    console.error("[CLOUD analytics] domain ownership check failed:", message);
-    return c.json({ error: "Could not verify domain ownership" }, 500);
-  }
-
-  const client = getOblienClient();
-
-  try {
+    const client = await getNamespaceClient(organizationId);
     switch (operation) {
-      case "timeseries": {
-        const result = await client.analytics.timeseries(domain, params as any);
-        return c.json(result);
-      }
-      case "requests": {
-        const result = await client.analytics.requests(domain, params as any);
-        return c.json(result);
-      }
-      case "streamToken": {
-        const result = await client.analytics.streamToken(domain);
-        return c.json(result);
-      }
+      case "timeseries":
+        return c.json(await client.analytics.timeseries(domain, params as any));
+      case "requests":
+        return c.json(await client.analytics.requests(domain, params as any));
+      case "streamToken":
+        return c.json(await client.analytics.streamToken(domain));
       default:
         return c.json({ error: "Unknown operation" }, 400);
     }
-  } catch (err: unknown) {
-    const status = typeof err === "object" && err !== null && "status" in err
-      ? (err as { status: number }).status
-      : 500;
-    const message = err instanceof Error ? err.message : "Analytics request failed";
-    c.status(status as 400 | 404 | 500);
-    return c.json({ error: message });
+  } catch (err) {
+    return oblienErrorResponse(c, err, "Analytics request failed");
   }
 }
 
 // ─── Namespace token minting ─────────────────────────────────────────────────
 
 export async function getToken(c: Context) {
-  const { ownerUserId } = await resolveCloudOwner(c);
-  const result = await issueNamespaceToken(ownerUserId);
+  const organizationId = getActiveOrganizationId(c);
+  const result = await issueNamespaceToken(organizationId);
   return c.json({ data: result });
 }
 
 export async function preflight(c: Context) {
-  const { ownerUserId } = await resolveCloudOwner(c);
+  const organizationId = getActiveOrganizationId(c);
   const body = await c.req.json<{ slug?: string; customDomain?: string }>();
-  const result = await runCloudPreflight(ownerUserId, {
+  const result = await runCloudPreflight(organizationId, {
     slug: body.slug,
     customDomain: body.customDomain,
   });
@@ -186,7 +161,7 @@ export async function disconnect(c: Context) {
   } catch (err) {
     console.error(
       "[cloud disconnect] failed to delete session row:",
-      err instanceof Error ? err.message : err,
+      safeErrorMessage(err),
     );
     return c.json({ error: "Failed to revoke session" }, 500);
   }
@@ -210,7 +185,7 @@ export async function disconnect(c: Context) {
       .catch((err) =>
         console.warn(
           "[cloud disconnect] audit emit failed:",
-          err instanceof Error ? err.message : err,
+          safeErrorMessage(err),
         ),
       );
   }
@@ -247,11 +222,6 @@ export async function account(c: Context) {
  *   - code_challenge (PKCE S256) is bound to the one-time code
  */
 export async function desktopHandoff(c: Context) {
-  const session = await auth.api.getSession({ headers: c.req.raw.headers });
-  if (!session) {
-    return c.json({ error: "No active session" }, 401);
-  }
-
   const redirect = c.req.query("redirect");
   if (!redirect) {
     return c.json({ error: "Missing redirect parameter" }, 400);
@@ -273,6 +243,19 @@ export async function desktopHandoff(c: Context) {
 
   const state = c.req.query("state");
   const codeChallenge = c.req.query("code_challenge");
+
+  // No session → bounce to /login. Desktop PKCE flow needs the
+  // state + code_challenge to survive the round-trip; carry them on
+  // the query so `getPostAuthRedirect` routes to /authorize.
+  const session = await auth.api.getSession({ headers: c.req.raw.headers });
+  if (!session) {
+    const loginUrl = new URL("/login", cloudRuntimeTarget.dashboard);
+    loginUrl.searchParams.set("callback", redirect);
+    loginUrl.searchParams.set("flow", "desktop-cloud");
+    if (state) loginUrl.searchParams.set("state", state);
+    if (codeChallenge) loginUrl.searchParams.set("code_challenge", codeChallenge);
+    return c.redirect(loginUrl.toString());
+  }
 
   const code = await generateHandoffCode(
     {
@@ -301,11 +284,6 @@ export async function desktopHandoff(c: Context) {
  *   - Codes are single-use with 60s TTL
  */
 export async function connectHandoff(c: Context) {
-  const session = await auth.api.getSession({ headers: c.req.raw.headers });
-  if (!session) {
-    return c.json({ error: "No active session" }, 401);
-  }
-
   const redirect = c.req.query("redirect");
   if (!redirect) {
     return c.json({ error: "Missing redirect parameter" }, 400);
@@ -327,6 +305,16 @@ export async function connectHandoff(c: Context) {
     if (port < 1024 || port > 65535) {
       return c.json({ error: "Redirect port must be ≥ 1024" }, 400);
     }
+  }
+
+  // No session → bounce to /login with the local-callback URL.
+  // /login's post-auth handler reads `?callback=` and forwards to
+  // the handoff URL after a successful sign-in.
+  const session = await auth.api.getSession({ headers: c.req.raw.headers });
+  if (!session) {
+    const loginUrl = new URL("/login", cloudRuntimeTarget.dashboard);
+    loginUrl.searchParams.set("callback", redirect);
+    return c.redirect(loginUrl.toString());
   }
 
   const code = await generateHandoffCode(
@@ -363,96 +351,65 @@ export async function exchangeCode(c: Context) {
 // ─── Managed edge proxy sync ─────────────────────────────────────────────────
 
 /**
- * POST /api/cloud/edge-proxy  { slug: string, target: string }
+ * POST /api/cloud/edge-proxy  { slug, target }
  *
- * Self-hosted/desktop instances send just the project slug + target IP.
- * SaaS uses the managed base domain (opsh.io) and creates slug.opsh.io.
+ * Self-hosted/desktop instances send the project slug + target IP.
+ * SaaS forwards to Oblien with the caller's namespace token. Oblien
+ * enforces slug uniqueness across the shared zone (returns 409 if
+ * another namespace owns it) and binds the proxy to the caller's
+ * namespace — no SaaS-side ledger needed.
  *
- * SECURITY: The handler uses a per-user namespace-scoped Oblien token rather
- * than the master client so the underlying Oblien API enforces namespace
- * isolation. A caller cannot overwrite another tenant's `slug.opsh.io` edge
- * proxy — the slug listing/update/enable calls only see proxies owned by
- * the caller's namespace. As a defense-in-depth layer we additionally
- * check that any pre-existing proxy with the same slug really lives in the
- * caller's namespace before mutating it.
+ * Idempotent: if the slug is already owned by the caller, Oblien
+ * returns the existing proxy. If owned by another tenant, Oblien
+ * returns 409 and we forward that status.
  */
 export async function syncEdgeProxy(c: Context) {
-  const { ownerUserId } = await resolveCloudOwner(c);
+  const organizationId = getActiveOrganizationId(c);
   const body = await c.req.json<{ slug?: string; target?: string }>();
   if (!body.slug || !body.target) {
     return c.json({ error: "slug and target are required" }, 400);
   }
 
-  const slug = body.slug.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  const slug = body.slug
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
   if (!slug) {
     return c.json({ error: "Invalid slug" }, 400);
   }
 
   const baseDomain = SYSTEM.DOMAINS.CLOUD_DOMAIN;
   const hostname = `${slug}.${baseDomain}`;
-  const target = body.target.startsWith("http://") || body.target.startsWith("https://")
-    ? body.target
-    : `http://${body.target}`;
+  const target =
+    body.target.startsWith("http://") || body.target.startsWith("https://")
+      ? body.target
+      : `http://${body.target}`;
 
   try {
-    // Org-owner namespace token: every team member of the active org
-    // shares the owner's Oblien namespace. Oblien still enforces
-    // namespace isolation on edgeProxy.list/create/update/enable —
-    // a caller cannot overwrite another org's `<slug>.opsh.io` route.
-    const { token } = await issueNamespaceToken(ownerUserId);
-    const client = new Oblien({ token });
-    const { proxies } = await client.edgeProxy.list();
-    const existing = proxies.find(
-      (p) => p.slug === slug,
-    );
-
-    if (!existing) {
-      await client.edgeProxy.create({ name: hostname, slug, domain: baseDomain, target });
-    } else {
-      if (existing.name !== hostname || existing.slug !== slug || existing.target !== target) {
-        await client.edgeProxy.update(existing.id, { name: hostname, slug, target });
-      }
-      if (existing.status === "disabled") {
-        await client.edgeProxy.enable(existing.id);
-      }
-    }
-
+    const client = await getNamespaceClient(organizationId);
+    await client.edgeProxy.create({ name: hostname, slug, domain: baseDomain, target });
     return c.json({ ok: true, hostname });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Failed to sync edge proxy";
-    const status = typeof err === "object" && err !== null && "status" in err && typeof (err as { status?: unknown }).status === "number"
-      ? (err as { status: number }).status
-      : 500;
-    const code = typeof err === "object" && err !== null && "code" in err
-      ? (err as { code?: unknown }).code
-      : undefined;
-    const details = typeof err === "object" && err !== null && "details" in err
-      ? (err as { details?: unknown }).details
-      : undefined;
-
-    console.error("[CLOUD] Edge proxy sync failed", { slug, baseDomain, target, status, code, details, message });
-    c.status(status as 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500);
-    return c.json({ error: message, code, details });
+  } catch (err) {
+    return oblienErrorResponse(c, err, "Failed to sync edge proxy");
   }
 }
 
-// ─── Pages proxy (master client) ─────────────────────────────────────────────
+// ─── Pages proxy ────────────────────────────────────────────────────────────
 
 /**
  * POST /api/cloud/pages  { workspace_id, path, name, slug, domain? }
  *
- * Local/desktop instances call this to create an Oblien static page on
- * a shared zone (e.g. `opsh.io`). Page creation on `opsh.io` touches
- * the master account's DNS — namespace tokens can't perform it, so
- * the SaaS executes the call with the master client on the user's
- * behalf. Pages without a `domain` (custom-domain or slug-only) don't
- * need this proxy — the namespace token can create them directly.
+ * Forwards to Oblien with the caller's namespace token. Oblien
+ * enforces:
+ *   - `workspace_id` must belong to the caller's namespace (or 404)
+ *   - `slug` must be free on the shared zone (or 409 SLUG_TAKEN)
  *
- * Returns the raw `{ page }` shape the Oblien SDK returns so the
- * caller can drop it straight into the existing CloudRuntime code path.
+ * Returns the raw Oblien SDK shape so the caller's CloudRuntime code
+ * path stays unchanged.
  */
 export async function pagesProxy(c: Context) {
-  const { ownerUserId } = await resolveCloudOwner(c);
+  const organizationId = getActiveOrganizationId(c);
   const body = await c.req.json<{
     workspace_id?: string;
     path?: string;
@@ -466,11 +423,7 @@ export async function pagesProxy(c: Context) {
   }
 
   try {
-    // Org-owner namespace token: pages.create rejects workspace_ids
-    // outside the org owner's namespace, enforcing isolation between
-    // team orgs while letting all members of one org share its pages.
-    const { token } = await issueNamespaceToken(ownerUserId);
-    const client = new Oblien({ token });
+    const client = await getNamespaceClient(organizationId);
     const result = await client.pages.create({
       workspace_id: body.workspace_id,
       path: body.path,
@@ -479,21 +432,8 @@ export async function pagesProxy(c: Context) {
       ...(body.domain ? { domain: body.domain } : {}),
     });
     return c.json(result);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Page creation failed";
-    const status = typeof err === "object" && err !== null && "status" in err && typeof (err as { status?: unknown }).status === "number"
-      ? (err as { status: number }).status
-      : 500;
-    const code = typeof err === "object" && err !== null && "code" in err
-      ? (err as { code?: unknown }).code
-      : undefined;
-    const details = typeof err === "object" && err !== null && "details" in err
-      ? (err as { details?: unknown }).details
-      : undefined;
-
-    console.error("[CLOUD] Pages proxy failed", { slug: body.slug, domain: body.domain, status, code, details, message });
-    c.status(status as 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500);
-    return c.json({ error: message, code, details });
+  } catch (err) {
+    return oblienErrorResponse(c, err, "Failed to create page");
   }
 }
 
@@ -727,10 +667,20 @@ export async function githubOauthBridge(c: Context) {
         // confused-deputy territory. Future Better Auth versions might
         // start emitting unexpected Set-Cookie headers during
         // linkSocialAccount; this allowlist makes that change inert.
+        // Better Auth's default state strategy is verification-table-backed
+        // (picked because `database: drizzleAdapter(...)` is set in lib/auth.ts),
+        // and that strategy names the signed state cookie "state" — NOT
+        // "oauth_state". See node_modules/better-auth/dist/state.mjs:43
+        // (`settings?.cookieName ?? "state"`). The "oauth_state" name only
+        // applies when advanced.storeStateStrategy === "cookie". We forward
+        // both names so this stays correct if the strategy ever changes.
         const allowedCookieNames = [
-          "oauth_state",                                 // default name
-          `${COOKIE_PREFIX}.oauth_state`,                // prefixed
-          `__Secure-${COOKIE_PREFIX}.oauth_state`,       // secure-prefixed (HTTPS prod)
+          "state",                                       // default (verification-table) strategy
+          `${COOKIE_PREFIX}.state`,                      // prefixed
+          `__Secure-${COOKIE_PREFIX}.state`,             // secure-prefixed (HTTPS prod)
+          "oauth_state",                                 // cookie-strategy default name
+          `${COOKIE_PREFIX}.oauth_state`,                // cookie-strategy prefixed
+          `__Secure-${COOKIE_PREFIX}.oauth_state`,       // cookie-strategy secure-prefixed
         ];
         const linkCookies = getSetCookieHeaders(linkResult.headers);
         const forwarded: string[] = [];
@@ -956,7 +906,7 @@ export async function githubInstallCallback(c: Context) {
       .catch((err) =>
         console.warn(
           "[github install-callback] audit emit failed:",
-          err instanceof Error ? err.message : err,
+          safeErrorMessage(err),
         ),
       );
 
@@ -1106,7 +1056,33 @@ export async function githubInstallationToken(c: Context) {
 export async function githubUserStatus(c: Context) {
   const userId = getUserId(c);
   const status = await githubAuth.getUserStatus(userId);
+
+  // Diagnostic: when the SaaS reports the user as disconnected, log the
+  // resolved userId and whether a GitHub account row exists for it.
+  // This distinguishes "wrong-user/stale-cloud-session" (no row in DB,
+  // SaaS is talking to a different user than the one OAuth linked)
+  // from "row exists but token refresh failed" (token fetch null).
   if (!status.connected) {
+    let githubRowCount = -1;
+    try {
+      const rows = await db
+        .select({ id: schema.account.id })
+        .from(schema.account)
+        .where(
+          and(
+            eq(schema.account.userId, userId),
+            eq(schema.account.providerId, "github"),
+          ),
+        );
+      githubRowCount = rows.length;
+    } catch (err) {
+      console.log(
+        `[cloud-saas:githubUserStatus] account lookup failed: ${safeErrorMessage(err)}`,
+      );
+    }
+    console.log(
+      `[cloud-saas:githubUserStatus] connected=false userId=${userId} githubAccountRowsForUser=${githubRowCount}`,
+    );
     return c.json({ data: { connected: false as const } });
   }
   return c.json({

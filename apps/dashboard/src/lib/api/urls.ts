@@ -1,258 +1,103 @@
-import { DASHBOARD_RUNTIME_TARGETS, DEFAULT_PORT } from "@repo/core";
+import { DASHBOARD_RUNTIME_TARGETS, DEFAULT_PORT, type DashboardRuntimeTarget } from "@repo/core";
 
-type RuntimeTarget = (typeof DASHBOARD_RUNTIME_TARGETS)[number];
+// The runtime-target table, flattened to an array with the id inlined
+// for browser-side lookup ("which row matches window.location?").
+const TARGETS = Object.entries(DASHBOARD_RUNTIME_TARGETS).map(([id, t]) => ({ id, ...t }));
+const DEFAULT_TARGET = TARGETS.find((t) => t.id === "local") ?? TARGETS[0]!;
 
-type DeploymentInfoFallback = Pick<RuntimeTarget, "selfHosted" | "deployMode" | "authMode"> & {
-  cloudAuthUrl: string;
-};
+type Target = (typeof TARGETS)[number];
 
-const API_PATH_SUFFIX = "/api";
-const AUTH_PATH_SUFFIX = "/api/auth";
-
-function isProduction() {
-  return process.env.NODE_ENV === "production";
-}
-
-function stripApiSuffix(pathname: string) {
-  const normalized = pathname.replace(/\/+$/, "") || "/";
-
-  if (normalized.endsWith(AUTH_PATH_SUFFIX)) {
-    return normalized.slice(0, -AUTH_PATH_SUFFIX.length) || "/";
-  }
-
-  if (normalized.endsWith(API_PATH_SUFFIX)) {
-    return normalized.slice(0, -API_PATH_SUFFIX.length) || "/";
-  }
-
-  return normalized;
-}
-
-function parseHttpUrl(rawUrl: string, source?: string) {
+/** Return the URL's origin (`scheme://host[:port]`), or undefined if not a valid http(s) URL. */
+function originOf(raw: string): string | undefined {
   try {
-    const url = new URL(rawUrl);
-    if (url.protocol !== "http:" && url.protocol !== "https:") {
-      throw new Error("unsupported protocol");
-    }
-    return url;
+    const u = new URL(raw);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return undefined;
+    return `${u.protocol}//${u.host}`;
   } catch {
-    if (source) {
-      throw new Error(`${source} must be a valid http(s) URL.`);
-    }
     return undefined;
   }
 }
 
-function toNormalizedOrigin(url: URL) {
-  url.search = "";
-  url.hash = "";
-  return url.toString().replace(/\/$/, "");
+/** Find the runtime target whose dashboard or api origin matches the URL. */
+function resolveTarget(rawUrl?: string): Target {
+  const origin = rawUrl ? originOf(rawUrl) : undefined;
+  if (!origin) return DEFAULT_TARGET;
+  return (
+    TARGETS.find(
+      (t) => originOf(t.dashboard) === origin || originOf(t.api) === origin,
+    ) ?? DEFAULT_TARGET
+  );
 }
 
-function normalizeOrigin(rawUrl: string, source?: string) {
-  const url = parseHttpUrl(rawUrl, source);
-  if (!url) {
-    return undefined;
-  }
-
-  url.pathname = "/";
-  return toNormalizedOrigin(url);
+/** The target this code is currently running under — from window.location in the browser. */
+function currentTarget(rawUrl?: string): Target {
+  const browserOrigin = typeof window !== "undefined" ? window.location.origin : undefined;
+  return resolveTarget(rawUrl ?? browserOrigin);
 }
 
-function normalizeApiOrigin(rawUrl: string, source?: string) {
-  const url = parseHttpUrl(rawUrl, source);
-  if (!url) {
-    return undefined;
-  }
-
-  url.pathname = stripApiSuffix(url.pathname);
-  return toNormalizedOrigin(url);
+/** The cloud-side target that the given target pairs with (per its cloudTargetId). */
+function cloudPartner(target: Target): Target {
+  return TARGETS.find((t) => t.id === target.cloudTargetId) ?? target;
 }
 
-const KNOWN_RUNTIME_TARGETS = DASHBOARD_RUNTIME_TARGETS.map((target) => ({
-  ...target,
-  dashboardOrigin: normalizeOrigin(target.dashboard, `dashboard target ${target.id}`)!,
-  apiOrigin: normalizeApiOrigin(target.api, `api target ${target.id}`)!,
-  apiSiteOrigin: normalizeOrigin(target.api, `api site target ${target.id}`)!,
-}));
-type KnownRuntimeTarget = (typeof KNOWN_RUNTIME_TARGETS)[number];
+// ─── Public exports ─────────────────────────────────────────────────────────
 
-const DEFAULT_RUNTIME_TARGET = KNOWN_RUNTIME_TARGETS.find(({ id }) => id === "local") ?? KNOWN_RUNTIME_TARGETS[0];
-
-if (!DEFAULT_RUNTIME_TARGET) {
-  throw new Error("At least one dashboard runtime target must be configured.");
-}
-
-function resolveRuntimeTargetByApiOrigin(apiOrigin: string) {
-  return KNOWN_RUNTIME_TARGETS.find(({ apiOrigin: knownApiOrigin }) => knownApiOrigin === apiOrigin);
-}
-
-function resolveRuntimeTarget(rawUrl?: string) {
-  if (!rawUrl) {
-    return undefined;
-  }
-
-  const parsedUrl = parseHttpUrl(rawUrl);
-  if (parsedUrl && !isProduction()) {
-    const cloudTarget = KNOWN_RUNTIME_TARGETS.find(({ id }) => id === "cloud-saas");
-    if (
-      cloudTarget &&
-      (parsedUrl.hostname === new URL(cloudTarget.dashboardOrigin).hostname ||
-        parsedUrl.hostname === new URL(cloudTarget.apiSiteOrigin).hostname)
-    ) {
-      return cloudTarget;
-    }
-
-    if (parsedUrl.port) {
-      const byDashboardPort = KNOWN_RUNTIME_TARGETS.find(({ dashboardOrigin }) =>
-        new URL(dashboardOrigin).port === parsedUrl.port);
-      if (byDashboardPort) {
-        return byDashboardPort;
-      }
-
-      const byApiPort = KNOWN_RUNTIME_TARGETS.find(({ apiOrigin }) =>
-        new URL(apiOrigin).port === parsedUrl.port);
-      if (byApiPort) {
-        return byApiPort;
-      }
-    }
-  }
-
-  const origin = normalizeOrigin(rawUrl);
-  if (!origin) {
-    return undefined;
-  }
-
-  return KNOWN_RUNTIME_TARGETS.find(({ dashboardOrigin, apiSiteOrigin }) =>
-    dashboardOrigin === origin || apiSiteOrigin === origin);
-}
-
-function resolveApiOrigin(rawUrl?: string) {
-  const target = resolveRuntimeTarget(rawUrl);
-  if (target) {
-    return target.apiOrigin;
-  }
-
-  const origin = rawUrl ? normalizeApiOrigin(rawUrl) : undefined;
-  return origin ? resolveRuntimeTargetByApiOrigin(origin)?.apiOrigin : undefined;
-}
-
-function requireResolvedApiOrigin(context: string, rawUrl?: string) {
-  const apiOrigin = resolveApiOrigin(rawUrl);
-  if (apiOrigin) {
-    return apiOrigin;
-  }
-
-  if (isProduction()) {
-    throw new Error(
-      `${context}: could not resolve the API origin from a known Openship runtime target.`,
-    );
-  }
-
-  return DEFAULT_RUNTIME_TARGET.apiOrigin;
-}
-
-function getRequestOriginFromHeaders(headers: Pick<Headers, "get">) {
+export function getRequestOriginFromHeaders(headers: Pick<Headers, "get">) {
   const host = headers.get("x-forwarded-host") ?? headers.get("host");
-  if (!host) {
-    return undefined;
-  }
-
-  const proto = headers.get("x-forwarded-proto")
-    ?? (host.startsWith("localhost") || host.startsWith("127.0.0.1") ? "http" : "https");
-
+  if (!host) return undefined;
+  const proto =
+    headers.get("x-forwarded-proto") ??
+    (host.startsWith("localhost") || host.startsWith("127.0.0.1") ? "http" : "https");
   return `${proto}://${host}`;
 }
 
-function getCurrentRuntimeTarget(rawUrl?: string) {
-  const browserOrigin = typeof window !== "undefined" ? window.location.origin : undefined;
-  return resolveRuntimeTarget(rawUrl ?? browserOrigin) ?? DEFAULT_RUNTIME_TARGET;
-}
-
-function resolveKnownRuntimeTargetById(id: RuntimeTarget["id"]) {
-  return KNOWN_RUNTIME_TARGETS.find((target) => target.id === id);
-}
-
-function getCloudRuntimeTargetFor(target: KnownRuntimeTarget) {
-  return resolveKnownRuntimeTargetById(target.cloudTargetId) ?? target;
-}
-
-function getCloudRuntimeTarget(rawUrl?: string) {
-  return getCloudRuntimeTargetFor(getCurrentRuntimeTarget(rawUrl));
-}
-
-function buildDeploymentInfoFallback(target?: KnownRuntimeTarget): DeploymentInfoFallback {
-  const runtimeTarget = target ?? DEFAULT_RUNTIME_TARGET;
-  const cloudTarget = getCloudRuntimeTargetFor(runtimeTarget);
-
-  return {
-    selfHosted: runtimeTarget.selfHosted,
-    deployMode: runtimeTarget.deployMode,
-    authMode: runtimeTarget.authMode,
-    cloudAuthUrl: cloudTarget.dashboardOrigin,
-  };
-}
-
-export function getApiOrigin() {
-  const requestOrigin = typeof window !== "undefined" ? window.location.origin : undefined;
-  return requireResolvedApiOrigin("Client API origin resolution", requestOrigin);
-}
-
-export function getApiOriginFromRequest(requestUrl: string) {
-  return requireResolvedApiOrigin("Request API origin resolution", requestUrl);
-}
-
-export function getApiOriginFromHeaders(headers: Pick<Headers, "get">) {
-  return requireResolvedApiOrigin("Server API origin resolution", getRequestOriginFromHeaders(headers));
+export function getApiOrigin(rawUrl?: string) {
+  return currentTarget(rawUrl).api;
 }
 
 export function getAuthBaseUrl() {
-  return `${getApiOrigin()}${AUTH_PATH_SUFFIX}`;
+  return `${getApiOrigin()}/api/auth`;
 }
 
 export function getRestApiBaseUrl() {
-  return `${getApiOrigin()}${API_PATH_SUFFIX}`;
+  return `${getApiOrigin()}/api`;
 }
 
 export function getCloudDashboardUrl(rawUrl?: string) {
-  if (rawUrl) {
-    return normalizeOrigin(rawUrl, "cloudAuthUrl")!;
-  }
-
-  return getCloudRuntimeTarget(rawUrl).dashboardOrigin;
+  return originOf(rawUrl ?? "") ?? cloudPartner(currentTarget()).dashboard;
 }
 
 export function getCloudApiOrigin(rawUrl?: string) {
-  if (rawUrl) {
-    return normalizeApiOrigin(rawUrl, "cloudApiUrl")!;
-  }
-
-  return getCloudRuntimeTarget(rawUrl).apiOrigin;
+  return originOf(rawUrl ?? "") ?? cloudPartner(currentTarget()).api;
 }
 
 /**
- * Origin of the public marketing site (the `apps/web` Next app), where
- * shareable docs and setup guides live. Pattern, by environment:
- *   - production: `app.openship.io` (dashboard) → `openship.io` (marketing)
- *   - SaaS local: `localhost:3002` → `localhost:3000`
- *   - self-host:  `localhost:3001` → `localhost:3000`
- * Server-side render falls back to the public origin.
+ * Origin of the public marketing site (apps/web), where docs and setup
+ * guides live. In production: app.openship.io → openship.io. In dev:
+ * localhost:3001/3002 → localhost:3000. SSR falls back to production.
  */
 export function getMarketingOrigin() {
   if (typeof window === "undefined") return "https://openship.io";
   const { protocol, hostname, port } = window.location;
-  if (hostname.startsWith("app.")) {
-    return `${protocol}//${hostname.slice(4)}`;
-  }
+  if (hostname.startsWith("app.")) return `${protocol}//${hostname.slice(4)}`;
   if (port === String(DEFAULT_PORT.dashboard) || port === String(DEFAULT_PORT.saasDashboard)) {
     return `${protocol}//${hostname}:${DEFAULT_PORT.web}`;
   }
   return "https://openship.io";
 }
 
-export function getFallbackDeploymentInfo(rawUrl?: string) {
-  return buildDeploymentInfoFallback(resolveRuntimeTarget(rawUrl));
-}
+type DeploymentInfoFallback = Pick<DashboardRuntimeTarget, "selfHosted" | "deployMode" | "authMode"> & {
+  cloudAuthUrl: string;
+};
 
-export function getFallbackDeploymentInfoFromHeaders(headers: Pick<Headers, "get">) {
-  return buildDeploymentInfoFallback(resolveRuntimeTarget(getRequestOriginFromHeaders(headers)));
+export function getFallbackDeploymentInfoFromHeaders(
+  headers: Pick<Headers, "get">,
+): DeploymentInfoFallback {
+  const target = resolveTarget(getRequestOriginFromHeaders(headers));
+  return {
+    selfHosted: target.selfHosted,
+    deployMode: target.deployMode,
+    authMode: target.authMode,
+    cloudAuthUrl: cloudPartner(target).dashboard,
+  };
 }

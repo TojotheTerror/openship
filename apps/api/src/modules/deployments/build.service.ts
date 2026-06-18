@@ -1299,7 +1299,7 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       (dep.envVars ?? {}) as Record<string, string>,
       (key: string, err: unknown) =>
         console.warn(
-          `[build] failed to decrypt env var ${key}: ${err instanceof Error ? err.message : err}`,
+          `[build] failed to decrypt env var ${key}: ${safeErrorMessage(err)}`,
         ),
     );
     const isLocalBuild = snapshot.buildStrategy === "local";

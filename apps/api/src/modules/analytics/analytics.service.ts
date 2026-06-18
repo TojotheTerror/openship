@@ -23,7 +23,7 @@ import {
   fetchMgmt,
 } from "../../lib/project-analytics";
 import { getAdminOblienClient } from "../../lib/oblien-user-client";
-import { cloudAnalyticsProxy } from "../../lib/cloud-client";
+import { cloudClient } from "../../lib/cloud-client";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -254,7 +254,7 @@ async function fetchCloudTimeseries(
     return client.analytics.timeseries(domain, params);
   }
 
-  return cloudAnalyticsProxy(organizationId, "timeseries", domain, params);
+  return cloudClient({ organizationId }).analytics.timeseries(domain, params);
 }
 
 export interface AnalyticsSummary {

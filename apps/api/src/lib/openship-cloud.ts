@@ -6,14 +6,20 @@
  * then use `new Oblien({ token })` to drive the full pipeline
  * themselves (workspaces.create, build, deploy - everything).
  *
+ * **Namespace identity = organization id**, NOT user id. This makes
+ * the namespace atomic per team: owner rotation doesn't move the
+ * namespace, every team member resolves the same one, and there's
+ * no `resolveCloudOwner` indirection in the SaaS controllers.
+ *
  * Two responsibilities:
- *   1. ensureNamespace(userId) - create-if-not-exists, cached
- *   2. issueNamespaceToken(userId) - mint a scoped token for the namespace
+ *   1. ensureNamespace(orgId) - create-if-not-exists, cached
+ *   2. issueNamespaceToken(orgId) - mint a scoped token for the namespace
  */
 
 import { Oblien } from "@repo/adapters";
 import { env } from "../config/env";
 import { safeErrorMessage } from "@repo/core";
+import { cacheStore } from "./cache-store";
 
 // ─── Oblien client (master credentials - SaaS only) ─────────────────────────
 
@@ -48,33 +54,39 @@ export function getOblienClient(): Oblien {
 
 // ─── Namespace management ────────────────────────────────────────────────────
 
-/** Cache: userId → namespace slug */
-const namespaceCache = new Map<string, string>();
+// Org ↔ namespace is effectively immutable — 1h TTL is generous and
+// self-heals on miss anyway via Oblien's idempotent `namespaces.ensure`.
+const NAMESPACE_CACHE_TTL_S = 60 * 60;
 
-function namespaceSlugForUser(userId: string): string {
-  return `os-${userId.toLowerCase().replace(/[^a-z0-9-]+/g, "-")}`;
+/**
+ * Org id → namespace slug. For solo users (orgId = `org_<userId>`)
+ * this strips the prefix → `os-<userId>` — keeping pre-multi-tenant
+ * namespaces stable. Team orgs get `os-<orgId>` directly.
+ */
+function namespaceSlugForOrg(orgId: string): string {
+  const stripped = orgId.startsWith("org_") ? orgId.slice(4) : orgId;
+  return `os-${stripped.toLowerCase().replace(/[^a-z0-9-]+/g, "-")}`;
 }
 
 /**
- * Ensure an Oblien namespace exists for a user.
- *
- * Slug: normalized `os-{userId}` in lowercase.
- * Uses Oblien's native idempotent `namespaces.ensure` API.
+ * Ensure an Oblien namespace exists for an org. Idempotent via
+ * Oblien's `namespaces.ensure`.
  */
-export async function ensureNamespace(userId: string): Promise<string> {
-  const cached = namespaceCache.get(userId);
+export async function ensureNamespace(organizationId: string): Promise<string> {
+  const store = await cacheStore<string>("oblien-namespaces");
+  const cached = await store.get(organizationId);
   if (cached) return cached;
 
   const client = getOblienClient();
-  const slug = namespaceSlugForUser(userId);
+  const slug = namespaceSlugForOrg(organizationId);
 
   const ensured = await client.namespaces.ensure({
-    name: `Openship ${userId}`,
+    name: `Openship ${organizationId}`,
     slug,
   });
 
   const namespace = ensured.data.slug || slug;
-  namespaceCache.set(userId, namespace);
+  await store.set(organizationId, namespace, NAMESPACE_CACHE_TTL_S);
   return namespace;
 }
 
@@ -87,17 +99,16 @@ export interface NamespaceTokenResult {
 }
 
 /**
- * Issue a namespace-scoped Oblien token for a user.
- *
- * The token gives full access to the user's namespace - create workspaces,
- * manage lifecycle, deploy, etc. Local instances use this to construct
- * `new Oblien({ token })` and run the full CloudRuntime pipeline.
+ * Issue a namespace-scoped Oblien token for an org. The token gives
+ * full access to the org's namespace — create workspaces, manage
+ * lifecycle, deploy, analytics, edge proxies, pages. Local instances
+ * construct `new Oblien({ token })` and run the full pipeline.
  *
  * TTL: 30 minutes (covers build + deploy + some buffer).
  */
-export async function issueNamespaceToken(userId: string): Promise<NamespaceTokenResult> {
+export async function issueNamespaceToken(organizationId: string): Promise<NamespaceTokenResult> {
   const client = getOblienClient();
-  const namespace = await ensureNamespace(userId);
+  const namespace = await ensureNamespace(organizationId);
 
   try {
     const result = await client.tokens.create({

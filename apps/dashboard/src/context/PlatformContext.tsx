@@ -49,23 +49,25 @@ interface PlatformProviderProps {
   hostDomain?: string;
 }
 
+/**
+ * Drives the platform context off SSR-passed props directly — only the
+ * mutable `selfHosted` toggle (used by the onboarding flow) needs
+ * local state. Previously every prop was frozen via `useState` at
+ * first mount, so a stale `cloudAuthUrl` from a one-off bad SSR latched
+ * for the SPA's lifetime. Now a fresh SSR (e.g. after the
+ * `_deploymentInfo` cache TTLs) always wins.
+ */
 export function PlatformProvider({
   children,
   selfHosted: initialSelfHosted = true,
-  deployMode: initialDeployMode = "docker",
-  authMode: initialAuthMode = "local",
-  cloudAuthUrl: initialCloudAuthUrl = CLOUD_DASHBOARD_URL,
-  machineName: initialMachineName,
-  hostDomain: initialHostDomain,
+  deployMode = "docker",
+  authMode = "local",
+  cloudAuthUrl = CLOUD_DASHBOARD_URL,
+  machineName,
+  hostDomain,
 }: PlatformProviderProps) {
   const [selfHosted, setSelfHostedState] = useState(initialSelfHosted);
-  const [deployMode] = useState(initialDeployMode);
-  const [authMode] = useState(initialAuthMode);
-  const [cloudAuthUrl] = useState(initialCloudAuthUrl);
-  const [machineName] = useState(initialMachineName);
-  const [hostDomain] = useState(initialHostDomain);
   const baseDomain = hostDomain || DEFAULT_CLOUD_DOMAIN;
-
   const setSelfHosted = useCallback((v: boolean) => setSelfHostedState(v), []);
 
   return (

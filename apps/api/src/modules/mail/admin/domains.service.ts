@@ -342,7 +342,7 @@ export async function deleteDomain(
         // Surface the first failure: leaving half-deleted state is worse
         // than aborting the cascade and letting the operator retry.
         throw new Error(
-          `cascade delete: failed to remove mailbox ${m.username}: ${err instanceof Error ? err.message : err}`,
+          `cascade delete: failed to remove mailbox ${m.username}: ${safeErrorMessage(err)}`,
         );
       }
     }
