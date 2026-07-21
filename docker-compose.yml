@@ -77,6 +77,18 @@ services:
       PORT: "4000"
       DATABASE_URL: postgresql://${POSTGRES_USER:-openship}:${POSTGRES_PASSWORD:-openship}@postgres:5432/${POSTGRES_DB:-openship}
       REDIS_URL: redis://redis:6379
+    # Mount host gh config so the dashboard's "Check connection" (and local
+    # gh CLI auth) can read ~/.config/gh/hosts.yml inside the container.
+    volumes:
+      - /root/.config/gh:/root/.config/gh:ro
+      # Self-hosted "docker" deploy mode drives the HOST Docker daemon (build +
+      # run app containers on this server, never Openship Cloud). The API image
+      # ships the docker CLI; this socket + group let it reach the daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
+    # gid of the host "docker" group (owner of docker.sock) so the non-root
+    # bun user can talk to the daemon.
+    group_add:
+      - "110"
     depends_on:
       postgres:
         condition: service_healthy
@@ -96,13 +108,14 @@ services:
       dockerfile: apps/dashboard/Dockerfile
     restart: unless-stopped
     ports:
-      - "3001:3001"
+      - "4001:3001"
     env_file:
       - .env
     environment:
       NODE_ENV: production
       PORT: "3001"
       INTERNAL_API_URL: http://api:4000
+      NEXT_PUBLIC_API_PROXY: "true"
     depends_on:
       api:
         condition: service_healthy
@@ -114,7 +127,7 @@ services:
       dockerfile: apps/web/Dockerfile
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "4002:3000"
     environment:
       NODE_ENV: production
       PORT: "3000"
